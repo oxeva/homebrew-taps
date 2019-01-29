@@ -13,6 +13,7 @@ class Openssh < Formula
   depends_on "pkg-config" => :build
 #  depends_on "ldns"
   depends_on "openssl@1.1"
+  plist_options :startup => true
 
   resource "com.openssh.sshd.sb" do
     url "https://opensource.apple.com/source/OpenSSH/OpenSSH-209.50.1/com.openssh.sshd.sb"
@@ -70,6 +71,42 @@ class Openssh < Formula
 
     buildpath.install resource("com.openssh.sshd.sb")
     (etc/"ssh").install "com.openssh.sshd.sb" => "org.openssh.sshd.sb"
+  end
+
+  def plist; <<~EOS
+    <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+                <key>Label</key>
+                <string>#{plist_name}</string>
+                <key>ProgramArguments</key>
+                <array>
+                        <string>/usr/local/bin/ssh-agent</string>
+                        <string>-D</string>
+                        <string>-a</string>
+                        <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
+                </array>
+                <key>RunAtLoad</key>
+                <true/>
+                <key>KeepAlive</key>
+	              <dict>
+                        <key>SuccessfulExit</key>
+                        <false/>
+                </dict>
+                <key>Sockets</key>
+                <dict>
+                        <key>Listener</key>
+                        <dict>
+                          <key>SockPathName</key>
+                          <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
+                        </dict>
+                </dict>
+                <key>EnableTransactions</key>
+                <true/>
+        </dict>
+        </plist>
+    EOS
   end
 
   test do
