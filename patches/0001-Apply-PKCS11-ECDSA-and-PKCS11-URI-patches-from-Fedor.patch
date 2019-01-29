@@ -1,0 +1,5600 @@
+From 443ef7303302a9b49b7e94e0de971c945db6c898 Mon Sep 17 00:00:00 2001
+From: Gabriel Barazer <gabriel@barazer.net>
+Date: Tue, 29 Jan 2019 01:06:04 +0100
+Subject: [PATCH] Apply PKCS11 ECDSA and PKCS11 URI patches from Fedora 28
+ https://src.fedoraproject.org/cgit/rpms/openssh.git/tree/
+
+---
+ Makefile.in                      |   24 +-
+ authfd.c                         |    2 +
+ configure.ac                     |   44 +
+ regress/Makefile                 |    7 +-
+ regress/agent-pkcs11.sh          |   13 +-
+ regress/locl.h                   |   78 ++
+ regress/pkcs11.sh                |  300 +++++
+ regress/soft-pkcs11.c            | 2058 ++++++++++++++++++++++++++++++
+ regress/unittests/Makefile       |    2 +-
+ regress/unittests/pkcs11/tests.c |  330 +++++
+ servconf.c                       |   11 +-
+ servconf.h                       |    1 +
+ ssh-add.c                        |   26 +
+ ssh-agent.c                      |  101 +-
+ ssh-keygen.c                     |    1 +
+ ssh-pkcs11-client.c              |  109 +-
+ ssh-pkcs11-helper.c              |   67 +-
+ ssh-pkcs11-uri.c                 |  395 ++++++
+ ssh-pkcs11-uri.h                 |   41 +
+ ssh-pkcs11.c                     |  895 ++++++++++---
+ ssh-pkcs11.h                     |    6 +
+ ssh.c                            |  101 +-
+ ssh_config.5                     |   13 +
+ sshd.c                           |    6 +-
+ sshd_config                      |    1 +
+ sshd_config.5                    |    7 +
+ 26 files changed, 4417 insertions(+), 222 deletions(-)
+ create mode 100644 regress/locl.h
+ create mode 100644 regress/pkcs11.sh
+ create mode 100644 regress/soft-pkcs11.c
+ create mode 100644 regress/unittests/pkcs11/tests.c
+ create mode 100644 ssh-pkcs11-uri.c
+ create mode 100644 ssh-pkcs11-uri.h
+
+diff --git a/Makefile.in b/Makefile.in
+index 126b2c74..c9d184c9 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -93,7 +93,7 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
+ 	atomicio.o dispatch.o mac.o uuencode.o misc.o utf8.o \
+ 	monitor_fdpass.o rijndael.o ssh-dss.o ssh-ecdsa.o ssh-rsa.o dh.o \
+ 	msg.o progressmeter.o dns.o entropy.o gss-genr.o umac.o umac128.o \
+-	ssh-pkcs11.o smult_curve25519_ref.o \
++	ssh-pkcs11.o ssh-pkcs11-uri.o smult_curve25519_ref.o \
+ 	poly1305.o chacha.o cipher-chachapoly.o \
+ 	ssh-ed25519.o digest-openssl.o digest-libc.o hmac.o \
+ 	sc25519.o ge25519.o fe25519.o ed25519.o verify.o hash.o \
+@@ -249,6 +249,8 @@ clean:	regressclean
+ 	rm -f regress/unittests/match/test_match$(EXEEXT)
+ 	rm -f regress/unittests/utf8/*.o
+ 	rm -f regress/unittests/utf8/test_utf8$(EXEEXT)
++	rm -f regress/unittests/pkcs11/*.o
++	rm -f regress/unittests/pkcs11/test_pkcs11$(EXEEXT)
+ 	rm -f regress/misc/kexfuzz/*.o
+ 	rm -f regress/misc/kexfuzz/kexfuzz$(EXEEXT)
+ 	(cd openbsd-compat && $(MAKE) clean)
+@@ -279,6 +281,8 @@ distclean:	regressclean
+ 	rm -f regress/unittests/match/test_match
+ 	rm -f regress/unittests/utf8/*.o
+ 	rm -f regress/unittests/utf8/test_utf8
++	rm -f regress/unittests/pkcs11/*.o
++	rm -f regress/unittests/pkcs11/test_pkcs11
+ 	rm -f regress/misc/kexfuzz/*.o
+ 	rm -f regress/misc/kexfuzz/kexfuzz$(EXEEXT)
+ 	(cd openbsd-compat && $(MAKE) distclean)
+@@ -441,6 +445,7 @@ regress-prep:
+ 	$(MKDIR_P) `pwd`/regress/unittests/kex
+ 	$(MKDIR_P) `pwd`/regress/unittests/match
+ 	$(MKDIR_P) `pwd`/regress/unittests/utf8
++	$(MKDIR_P) `pwd`/regress/unittests/pkcs11
+ 	$(MKDIR_P) `pwd`/regress/misc/kexfuzz
+ 	[ -f `pwd`/regress/Makefile ] || \
+ 	    ln -s `cd $(srcdir) && pwd`/regress/Makefile `pwd`/regress/Makefile
+@@ -459,6 +464,11 @@ regress/netcat$(EXEEXT): $(srcdir)/regress/netcat.c $(REGRESSLIBS)
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(srcdir)/regress/netcat.c \
+ 	$(LDFLAGS) -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(LIBS)
+ 
++regress/soft-pkcs11.so: $(srcdir)/regress/soft-pkcs11.c $(REGRESSLIBS)
++	$(CC) $(CFLAGS) $(CPPFLAGS) -fpic -c $(srcdir)/regress/soft-pkcs11.c \
++	 -o $(srcdir)/regress/soft-pkcs11.o
++	$(CC) -shared -o $@ $(srcdir)/regress/soft-pkcs11.o
++
+ regress/check-perm$(EXEEXT): $(srcdir)/regress/check-perm.c $(REGRESSLIBS)
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(srcdir)/regress/check-perm.c \
+ 	$(LDFLAGS) -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(LIBS)
+@@ -564,6 +574,16 @@ regress/unittests/utf8/test_utf8$(EXEEXT): \
+ 	    regress/unittests/test_helper/libtest_helper.a \
+ 	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(LIBS)
+ 
++UNITTESTS_TEST_PKCS11_OBJS=\
++	regress/unittests/pkcs11/tests.o
++
++regress/unittests/pkcs11/test_pkcs11$(EXEEXT): \
++    ${UNITTESTS_TEST_PKCS11_OBJS} \
++    regress/unittests/test_helper/libtest_helper.a libssh.a
++	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_PKCS11_OBJS) \
++	    regress/unittests/test_helper/libtest_helper.a \
++	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(LIBS)
++
+ MISC_KEX_FUZZ_OBJS=\
+ 	regress/misc/kexfuzz/kexfuzz.o
+ 
+@@ -574,6 +594,7 @@ regress/misc/kexfuzz/kexfuzz$(EXEEXT): ${MISC_KEX_FUZZ_OBJS} libssh.a
+ regress-binaries: regress/modpipe$(EXEEXT) \
+ 	regress/setuid-allowed$(EXEEXT) \
+ 	regress/netcat$(EXEEXT) \
++	regress/soft-pkcs11.so \
+ 	regress/check-perm$(EXEEXT) \
+ 	regress/mkdtemp$(EXEEXT) \
+ 	regress/unittests/sshbuf/test_sshbuf$(EXEEXT) \
+@@ -584,6 +605,7 @@ regress-binaries: regress/modpipe$(EXEEXT) \
+ 	regress/unittests/kex/test_kex$(EXEEXT) \
+ 	regress/unittests/match/test_match$(EXEEXT) \
+ 	regress/unittests/utf8/test_utf8$(EXEEXT) \
++	regress/unittests/pkcs11/test_pkcs11$(EXEEXT) \
+ 	regress/misc/kexfuzz/kexfuzz$(EXEEXT)
+ 
+ tests interop-tests t-exec unit: regress-prep regress-binaries $(TARGETS)
+diff --git a/authfd.c b/authfd.c
+index 62cbf8c1..90705e7d 100644
+--- a/authfd.c
++++ b/authfd.c
+@@ -312,6 +312,8 @@ ssh_free_identitylist(struct ssh_identitylist *idl)
+ 		if (idl->comments != NULL)
+ 			free(idl->comments[i]);
+ 	}
++	free(idl->keys);
++	free(idl->comments);
+ 	free(idl);
+ }
+ 
+diff --git a/configure.ac b/configure.ac
+index 9920ede5..10381330 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1850,12 +1850,14 @@ AC_LINK_IFELSE(
+ 	[AC_DEFINE([HAVE_ISBLANK], [1], [Define if you have isblank(3C).])
+ ])
+ 
++SCARD_MSG="yes"
+ disable_pkcs11=
+ AC_ARG_ENABLE([pkcs11],
+ 	[  --disable-pkcs11        disable PKCS#11 support code [no]],
+ 	[
+ 		if test "x$enableval" = "xno" ; then
+ 			disable_pkcs11=1
++			SCARD_MSG="no"
+ 		fi
+ 	]
+ )
+@@ -1871,6 +1873,40 @@ if test "x$openssl" = "xyes" && test "x$disable_pkcs11" = "x"; then
+ 	)
+ fi
+ 
++# Check whether we have a p11-kit, we got default provider on command line
++DEFAULT_PKCS11_PROVIDER_MSG="no"
++AC_ARG_WITH([default-pkcs11-provider],
++	[  --with-default-pkcs11-provider[[=PATH]]   Use default pkcs11 provider (p11-kit detected by default)],
++	[ if test "x$withval" != "xno" && test "x$disable_pkcs11" = "x"; then
++		if test "x$withval" = "xyes" ; then
++			AC_PATH_TOOL([PKGCONFIG], [pkg-config], [no])
++			if test "x$PKGCONFIG" != "xno"; then
++				AC_MSG_CHECKING([if $PKGCONFIG knows about p11-kit])
++				if "$PKGCONFIG" "p11-kit-1"; then
++					AC_MSG_RESULT([yes])
++					use_pkgconfig_for_p11kit=yes
++				else
++					AC_MSG_RESULT([no])
++				fi
++			fi
++		else
++			PKCS11_PATH="${withval}"
++		fi
++		if test "x$use_pkgconfig_for_p11kit" = "xyes"; then
++			PKCS11_PATH=`$PKGCONFIG --variable=proxy_module p11-kit-1`
++		fi
++		AC_CHECK_FILE("$PKCS11_PATH",
++			[ AC_DEFINE_UNQUOTED([PKCS11_DEFAULT_PROVIDER], ["$PKCS11_PATH"], [Path to default PKCS#11 provider (p11-kit proxy)])
++			  DEFAULT_PKCS11_PROVIDER_MSG="$PKCS11_PATH"
++			],
++			[ AC_MSG_ERROR([Requested PKCS11 provided not found]) ]
++		)
++	else
++		AC_MSG_WARN([Needs PKCS11 support to enable default pkcs11 provider])
++	fi ]
++)
++
++
+ # IRIX has a const char return value for gai_strerror()
+ AC_CHECK_FUNCS([gai_strerror], [
+ 	AC_DEFINE([HAVE_GAI_STRERROR])
+@@ -5049,6 +5085,12 @@ AC_ARG_WITH([lastlog],
+ 		fi
+ 	]
+ )
++AC_ARG_ENABLE(vendor-patchlevel,
++  [  --enable-vendor-patchlevel=TAG  specify a vendor patch level],
++  [AC_DEFINE_UNQUOTED(SSH_VENDOR_PATCHLEVEL,[SSH_RELEASE "-" "$enableval"],[Define to your vendor patch level, if it has been modified from the upstream source release.])
++   SSH_VENDOR_PATCHLEVEL="$enableval"],
++  [AC_DEFINE(SSH_VENDOR_PATCHLEVEL,SSH_RELEASE,[Define to your vendor patch level, if it has been modified from the upstream source release.])
++   SSH_VENDOR_PATCHLEVEL=none])
+ 
+ dnl lastlog, [uw]tmpx? detection
+ dnl  NOTE: set the paths in the platform section to avoid the
+@@ -5316,6 +5358,8 @@ echo "           Translate v4 in v6 hack: $IPV4_IN6_HACK_MSG"
+ echo "                  BSD Auth support: $BSD_AUTH_MSG"
+ echo "              Random number source: $RAND_MSG"
+ echo "             Privsep sandbox style: $SANDBOX_STYLE"
++echo "                Vendor patch level: $SSH_VENDOR_PATCHLEVEL"
++echo "          Default PKCS#11 provider: $DEFAULT_PKCS11_PROVIDER_MSG"
+ 
+ echo ""
+ 
+diff --git a/regress/Makefile b/regress/Makefile
+index 647b4a04..3b625ac8 100644
+--- a/regress/Makefile
++++ b/regress/Makefile
+@@ -109,9 +109,11 @@ CLEANFILES=	*.core actual agent-key.* authorized_keys_${USERNAME} \
+ 		known_hosts known_hosts-cert known_hosts.* krl-* ls.copy \
+ 		modpipe netcat no_identity_config \
+ 		pidfile putty.rsa2 ready regress.log \
+-		remote_pid revoked-* rsa rsa-agent rsa-agent.pub rsa.pub \
++		remote_pid revoked-* rsa rsa-agent rsa-agent.pub \
++		rsa-agent-cert.pub rsa.pub \
+ 		rsa1 rsa1-agent rsa1-agent.pub rsa1.pub rsa_ssh2_cr.prv \
+-		rsa_ssh2_crnl.prv scp-ssh-wrapper.exe \
++		soft-pkcs11.so soft-pkcs11.o pkcs11*.crt pkcs11*.key \
++		pkcs11.info rsa_ssh2_crnl.prv scp-ssh-wrapper.exe \
+ 		scp-ssh-wrapper.scp setuid-allowed sftp-server.log \
+ 		sftp-server.sh sftp.log ssh-log-wrapper.sh ssh.log \
+ 		ssh_config ssh_config.* ssh_proxy ssh_proxy_bak \
+@@ -226,6 +228,7 @@ unit:
+ 		V="" ; \
+ 		test "x${USE_VALGRIND}" = "x" || \
+ 		    V=${.CURDIR}/valgrind-unit.sh ; \
++		$$V ${.OBJDIR}/unittests/pkcs11/test_pkcs11 ; \
+ 		$$V ${.OBJDIR}/unittests/sshbuf/test_sshbuf ; \
+ 		$$V ${.OBJDIR}/unittests/sshkey/test_sshkey \
+ 			-d ${.CURDIR}/unittests/sshkey/testdata ; \
+diff --git a/regress/agent-pkcs11.sh b/regress/agent-pkcs11.sh
+index db3018b8..4991d0bc 100644
+--- a/regress/agent-pkcs11.sh
++++ b/regress/agent-pkcs11.sh
+@@ -4,10 +4,17 @@
+ tid="pkcs11 agent test"
+ 
+ TEST_SSH_PIN=""
+-TEST_SSH_PKCS11=/usr/local/lib/soft-pkcs11.so.0.0
++TEST_SSH_PKCS11=$OBJ/soft-pkcs11.so
+ 
+ test -f "$TEST_SSH_PKCS11" || fatal "$TEST_SSH_PKCS11 does not exist"
+ 
++# requires ssh-agent built with correct path to ssh-pkcs11-helper
++# otherwise it fails to start the helper
++strings ${TEST_SSH_SSHAGENT} | grep "$TEST_SSH_SSHPKCS11HELPER"
++if [ $? -ne 0 ]; then
++	fatal "Needs to reconfigure with --libexecdir=\`pwd\` or so"
++fi
++
+ # setup environment for soft-pkcs11 token
+ SOFTPKCS11RC=$OBJ/pkcs11.info
+ export SOFTPKCS11RC
+@@ -23,7 +30,7 @@ notty() {
+ }
+ 
+ trace "start agent"
+-eval `${SSHAGENT} -s` > /dev/null
++eval `${SSHAGENT} -s -P "${OBJ}/*"` > /dev/null
+ r=$?
+ if [ $r -ne 0 ]; then
+ 	fail "could not start ssh-agent: exit code $r"
+@@ -60,7 +67,7 @@ else
+ 	fi
+ 
+ 	trace "remove pkcs11 keys"
+-	echo ${TEST_SSH_PIN} | notty ${SSHADD} -e ${TEST_SSH_PKCS11} > /dev/null 2>&1
++	${SSHADD} -e ${TEST_SSH_PKCS11} > /dev/null 2>&1
+ 	r=$?
+ 	if [ $r -ne 0 ]; then
+ 		fail "ssh-add -e failed: exit code $r"
+diff --git a/regress/locl.h b/regress/locl.h
+new file mode 100644
+index 00000000..70f4af0e
+--- /dev/null
++++ b/regress/locl.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (c) 2004, Stockholms universitet
++ * (Stockholm University, Stockholm Sweden)
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the university nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/* $Id: locl.h,v 1.5 2005/08/28 15:30:31 lha Exp $ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <openssl/err.h>
++#include <openssl/evp.h>
++#include <openssl/pem.h>
++#include <openssl/rand.h>
++#include <openssl/x509.h>
++
++#include <ctype.h>
++#include <errno.h>
++#include <pwd.h>
++#include <stdarg.h>
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../pkcs11.h"
++
++#define OPENSSL_ASN1_MALLOC_ENCODE(T, B, BL, S, R)			\
++{									\
++  unsigned char *p;							\
++  (BL) = i2d_##T((S), NULL);						\
++  if ((BL) <= 0) {							\
++     (R) = EINVAL;							\
++  } else {								\
++    (B) = malloc((BL));							\
++    if ((B) == NULL) {							\
++       (R) = ENOMEM;							\
++    } else {								\
++        p = (B);							\
++        (R) = 0;							\
++        (BL) = i2d_##T((S), &p);					\
++        if ((BL) <= 0) {						\
++           free((B));                                          		\
++           (R) = EINVAL;						\
++        }								\
++    }									\
++  }									\
++}
+diff --git a/regress/pkcs11.sh b/regress/pkcs11.sh
+new file mode 100644
+index 00000000..ac99a6d3
+--- /dev/null
++++ b/regress/pkcs11.sh
+@@ -0,0 +1,300 @@
++#
++#  Copyright (c) 2017 Red Hat
++#
++#  Authors: Jakub Jelen <jjelen@redhat.com>
++#
++#  Permission to use, copy, modify, and distribute this software for any
++#  purpose with or without fee is hereby granted, provided that the above
++#  copyright notice and this permission notice appear in all copies.
++#
++#  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++#  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++#  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++#  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++#  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++#  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++#  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++tid="pkcs11 tests with soft token"
++
++TEST_SSH_PIN=""
++TEST_SSH_PKCS11=$OBJ/soft-pkcs11.so
++
++test -f "$TEST_SSH_PKCS11" || fatal "$TEST_SSH_PKCS11 does not exist"
++
++# requires ssh-agent built with correct path to ssh-pkcs11-helper
++# otherwise it fails to start the helper
++strings ${TEST_SSH_SSHAGENT} | grep "$TEST_SSH_SSHPKCS11HELPER"
++if [ $? -ne 0 ]; then
++	fatal "Needs to reconfigure with --libexecdir=\`pwd\` or so"
++fi
++
++# setup environment for soft-pkcs11 token
++SOFTPKCS11RC=$OBJ/pkcs11.info
++rm -f $SOFTPKCS11RC
++export SOFTPKCS11RC
++# prevent ssh-agent from calling ssh-askpass
++SSH_ASKPASS=/usr/bin/true
++export SSH_ASKPASS
++unset DISPLAY
++
++# start command w/o tty, so ssh accepts pin from stdin (from agent-pkcs11.sh)
++notty() {
++	perl -e 'use POSIX; POSIX::setsid();
++	    if (fork) { wait; exit($? >> 8); } else { exec(@ARGV) }' "$@"
++}
++
++create_key() {
++	ID=$1
++	LABEL=$2
++	rm -f $OBJ/pkcs11-${ID}.key $OBJ/pkcs11-${ID}.crt
++	openssl genrsa -out $OBJ/pkcs11-${ID}.key 2048 > /dev/null 2>&1
++	chmod 600 $OBJ/pkcs11-${ID}.key
++	openssl req -key $OBJ/pkcs11-${ID}.key -new -x509 \
++	    -out $OBJ/pkcs11-${ID}.crt -text -subj '/CN=pkcs11 test' >/dev/null
++	printf "${ID}\t${LABEL}\t$OBJ/pkcs11-${ID}.crt\t$OBJ/pkcs11-${ID}.key\n" \
++	    >> $SOFTPKCS11RC
++}
++
++trace "Create a key pairs on soft token"
++ID1="02"
++ID2="04"
++create_key "$ID1" "SSH RSA Key"
++create_key "$ID2" "SSH RSA Key 2"
++
++trace "List the keys in the ssh-keygen with PKCS#11 URIs"
++${SSHKEYGEN} -D ${TEST_SSH_PKCS11} > $OBJ/token_keys
++if [ $? -ne 0 ]; then
++	fail "keygen fails to enumerate keys on PKCS#11 token"
++fi
++grep "pkcs11:" $OBJ/token_keys > /dev/null
++if [ $? -ne 0 ]; then
++	fail "The keys from ssh-keygen do not contain PKCS#11 URI as a comment"
++fi
++tail -n 1 $OBJ/token_keys > $OBJ/authorized_keys_$USER
++
++
++trace "Simple connect with ssh (without PKCS#11 URI)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -I ${TEST_SSH_PKCS11} \
++    -F $OBJ/ssh_proxy somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with pkcs11 failed (exit code $r)"
++fi
++
++
++trace "Connect with PKCS#11 URI"
++trace "  (second key should succeed)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++    -i "pkcs11:id=${ID2}?module-path=${TEST_SSH_PKCS11}" somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with PKCS#11 URI failed (exit code $r)"
++fi
++
++trace "  (first key should fail)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++     -i "pkcs11:id=${ID1}?module-path=${TEST_SSH_PKCS11}" somehost exit 5
++r=$?
++if [ $r -eq 5 ]; then
++	fail "ssh connect with PKCS#11 URI succeeded (should fail)"
++fi
++
++trace "Connect with various filtering options in PKCS#11 URI"
++trace "  (by object label, second key should succeed)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++    -i "pkcs11:object=SSH%20RSA%20Key%202?module-path=${TEST_SSH_PKCS11}" somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with PKCS#11 URI failed (exit code $r)"
++fi
++
++trace "  (by object label, first key should fail)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++     -i "pkcs11:object=SSH%20RSA%20Key?module-path=${TEST_SSH_PKCS11}" somehost exit 5
++r=$?
++if [ $r -eq 5 ]; then
++	fail "ssh connect with PKCS#11 URI succeeded (should fail)"
++fi
++
++trace "  (by token label, second key should succeed)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++    -i "pkcs11:id=${ID2};token=SoftToken%20(token)?module-path=${TEST_SSH_PKCS11}" somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with PKCS#11 URI failed (exit code $r)"
++fi
++
++trace "  (by wrong token label, should fail)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++     -i "pkcs11:token=SoftToken?module-path=${TEST_SSH_PKCS11}" somehost exit 5
++r=$?
++if [ $r -eq 5 ]; then
++	fail "ssh connect with PKCS#11 URI succeeded (should fail)"
++fi
++
++
++
++
++trace "Test PKCS#11 URI specification in configuration files"
++echo "IdentityFile \"pkcs11:id=${ID2}?module-path=${TEST_SSH_PKCS11}\"" \
++    >> $OBJ/ssh_proxy
++trace "  (second key should succeed)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with PKCS#11 URI in config failed (exit code $r)"
++fi
++
++trace "  (first key should fail)"
++head -n 1 $OBJ/token_keys > $OBJ/authorized_keys_$USER
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy somehost exit 5
++r=$?
++if [ $r -eq 5 ]; then
++	fail "ssh connect with PKCS#11 URI in config succeeded (should fail)"
++fi
++sed -i -e "/IdentityFile/d" $OBJ/ssh_proxy
++
++trace "Test PKCS#11 URI specification in configuration files with bogus spaces"
++echo "IdentityFile \"    pkcs11:id=${ID1}?module-path=${TEST_SSH_PKCS11}    \"" \
++    >> $OBJ/ssh_proxy
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with PKCS#11 URI with bogus spaces in config failed" \
++	    "(exit code $r)"
++fi
++sed -i -e "/IdentityFile/d" $OBJ/ssh_proxy
++
++
++trace "Combination of PKCS11Provider and PKCS11URI on commandline"
++trace "  (first key should succeed)"
++echo ${TEST_SSH_PIN} | notty ${SSH} -F $OBJ/ssh_proxy \
++    -i "pkcs11:id=${ID1}" -I ${TEST_SSH_PKCS11} somehost exit 5
++r=$?
++if [ $r -ne 5 ]; then
++	fail "ssh connect with PKCS#11 URI and provider combination" \
++	    "failed (exit code $r)"
++fi
++
++trace "Regress: Missing provider in PKCS11URI option"
++${SSH} -F $OBJ/ssh_proxy \
++    -o IdentityFile=\"pkcs11:token=segfault\" somehost exit 5
++r=$?
++if [ $r -eq 139 ]; then
++	fail "ssh connect with missing provider_id from configuration option" \
++	    "crashed (exit code $r)"
++fi
++
++
++trace "SSH Agent can work with PKCS#11 URI"
++trace "start the agent"
++eval `${SSHAGENT} -s -P "${OBJ}/*"` > /dev/null
++
++r=$?
++if [ $r -ne 0 ]; then
++	fail "could not start ssh-agent: exit code $r"
++else
++	trace "add whole provider to agent"
++	echo ${TEST_SSH_PIN} | notty ${SSHADD} \
++	    "pkcs11:?module-path=${TEST_SSH_PKCS11}" > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add failed with whole provider: exit code $r"
++	fi
++
++	trace " pkcs11 list via agent (all keys)"
++	${SSHADD} -l > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add -l failed with whole provider: exit code $r"
++	fi
++
++	trace " pkcs11 connect via agent (all keys)"
++	${SSH} -F $OBJ/ssh_proxy somehost exit 5
++	r=$?
++	if [ $r -ne 5 ]; then
++		fail "ssh connect failed with whole provider (exit code $r)"
++	fi
++
++	trace " remove pkcs11 keys (all keys)"
++	${SSHADD} -d "pkcs11:?module-path=${TEST_SSH_PKCS11}" > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add -d failed with whole provider: exit code $r"
++	fi
++
++	trace "add only first key to the agent"
++	echo ${TEST_SSH_PIN} | notty ${SSHADD} \
++	    "pkcs11:id=${ID1}?module-path=${TEST_SSH_PKCS11}" > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add failed with first key: exit code $r"
++	fi
++
++	trace " pkcs11 connect via agent (first key)"
++	${SSH} -F $OBJ/ssh_proxy somehost exit 5
++	r=$?
++	if [ $r -ne 5 ]; then
++		fail "ssh connect failed with first key (exit code $r)"
++	fi
++
++	trace " remove first pkcs11 key"
++	${SSHADD} -d "pkcs11:id=${ID1}?module-path=${TEST_SSH_PKCS11}" \
++	    > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add -d failed with first key: exit code $r"
++	fi
++
++	trace "add only second key to the agent"
++	echo ${TEST_SSH_PIN} | notty ${SSHADD} \
++	    "pkcs11:id=${ID2}?module-path=${TEST_SSH_PKCS11}" > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add failed with second key: exit code $r"
++	fi
++
++	trace " pkcs11 connect via agent (second key should fail)"
++	${SSH} -F $OBJ/ssh_proxy somehost exit 5
++	r=$?
++	if [ $r -eq 5 ]; then
++		fail "ssh connect passed without key (should fail)"
++	fi
++
++	trace "add also the first key to the agent"
++	echo ${TEST_SSH_PIN} | notty ${SSHADD} \
++	    "pkcs11:id=${ID1}?module-path=${TEST_SSH_PKCS11}" > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add failed with first key: exit code $r"
++	fi
++
++	trace " remove second pkcs11 key"
++	${SSHADD} -d "pkcs11:id=${ID2}?module-path=${TEST_SSH_PKCS11}" \
++	    > /dev/null 2>&1
++	r=$?
++	if [ $r -ne 0 ]; then
++		fail "ssh-add -d failed with second key: exit code $r"
++	fi
++
++	trace " remove already-removed pkcs11 key should fail"
++	${SSHADD} -d "pkcs11:id=${ID2}?module-path=${TEST_SSH_PKCS11}" \
++	    > /dev/null 2>&1
++	r=$?
++	if [ $r -eq 0 ]; then
++		fail "ssh-add -d passed with non-existing key (should fail)"
++	fi
++
++	trace " pkcs11 connect via agent (the first key should be still usable)"
++	${SSH} -F $OBJ/ssh_proxy somehost exit 5
++	r=$?
++	if [ $r -ne 5 ]; then
++		fail "ssh connect failed with first key (after removing second): exit code $r"
++	fi
++
++	trace "kill agent"
++	${SSHAGENT} -k > /dev/null
++fi
++
++rm -rf $OBJ/.tokens $OBJ/token_keys
+diff --git a/regress/soft-pkcs11.c b/regress/soft-pkcs11.c
+new file mode 100644
+index 00000000..9833d3de
+--- /dev/null
++++ b/regress/soft-pkcs11.c
+@@ -0,0 +1,2058 @@
++/*
++ * Copyright (c) 2004-2006, Stockholms universitet
++ * (Stockholm University, Stockholm Sweden)
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the university nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "locl.h"
++
++/* RCSID("$Id: main.c,v 1.24 2006/01/11 12:42:53 lha Exp $"); */
++
++#define OBJECT_ID_MASK		0xfff
++#define HANDLE_OBJECT_ID(h)	((h) & OBJECT_ID_MASK)
++#define OBJECT_ID(obj)		HANDLE_OBJECT_ID((obj)->object_handle)
++
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++ #define RSA_PKCS1_SSLeay RSA_PKCS1_OpenSSL
++#endif
++
++struct st_attr {
++    CK_ATTRIBUTE attribute;
++    int secret;
++};
++
++struct st_object {
++    CK_OBJECT_HANDLE object_handle;
++    struct st_attr *attrs;
++    int num_attributes;
++    enum {
++	STO_T_CERTIFICATE,
++	STO_T_PRIVATE_KEY,
++	STO_T_PUBLIC_KEY
++    } type;
++    union {
++	X509 *cert;
++	EVP_PKEY *public_key;
++	struct {
++	    const char *file;
++	    EVP_PKEY *key;
++	    X509 *cert;
++	} private_key;
++    } u;
++};
++
++static struct soft_token {
++    CK_VOID_PTR application;
++    CK_NOTIFY notify;
++    struct {
++	struct st_object **objs;
++	int num_objs;
++    } object;
++    struct {
++	int hardware_slot;
++	int app_error_fatal;
++	int login_done;
++    } flags;
++    int open_sessions;
++    struct session_state {
++	CK_SESSION_HANDLE session_handle;
++
++	struct {
++	    CK_ATTRIBUTE *attributes;
++	    CK_ULONG num_attributes;
++	    int next_object;
++	} find;
++
++	int encrypt_object;
++	CK_MECHANISM_PTR encrypt_mechanism;
++	int decrypt_object;
++	CK_MECHANISM_PTR decrypt_mechanism;
++	int sign_object;
++	CK_MECHANISM_PTR sign_mechanism;
++	int verify_object;
++	CK_MECHANISM_PTR verify_mechanism;
++	int digest_object;
++    } state[10];
++#define MAX_NUM_SESSION (sizeof(soft_token.state)/sizeof(soft_token.state[0]))
++    FILE *logfile;
++} soft_token;
++
++static void
++application_error(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    vprintf(fmt, ap);
++    va_end(ap);
++    if (soft_token.flags.app_error_fatal)
++	abort();
++}
++
++static void
++st_logf(const char *fmt, ...)
++{
++    va_list ap;
++    if (soft_token.logfile == NULL)
++	return;
++    va_start(ap, fmt);
++    vfprintf(soft_token.logfile, fmt, ap);
++    va_end(ap);
++    fflush(soft_token.logfile);
++}
++
++static void
++snprintf_fill(char *str, size_t size, char fillchar, const char *fmt, ...)
++{
++    int len;
++    va_list ap;
++    len = vsnprintf(str, size, fmt, ap);
++    va_end(ap);
++    if (len < 0 || len > (int) size)
++	return;
++    while(len < (int) size)
++	str[len++] = fillchar;
++}
++
++#ifndef TEST_APP
++#define printf error_use_st_logf
++#endif
++
++#define VERIFY_SESSION_HANDLE(s, state)			\
++{							\
++    CK_RV ret;						\
++    ret = verify_session_handle(s, state);		\
++    if (ret != CKR_OK) {				\
++	/* return CKR_OK */;				\
++    }							\
++}
++
++static CK_RV
++verify_session_handle(CK_SESSION_HANDLE hSession,
++		      struct session_state **state)
++{
++    size_t i;
++
++    for (i = 0; i < MAX_NUM_SESSION; i++){
++	if (soft_token.state[i].session_handle == hSession)
++	    break;
++    }
++    if (i == MAX_NUM_SESSION) {
++	application_error("use of invalid handle: 0x%08lx\n",
++			  (unsigned long)hSession);
++	return CKR_SESSION_HANDLE_INVALID;
++    }
++    if (state)
++	*state = &soft_token.state[i];
++    return CKR_OK;
++}
++
++static CK_RV
++object_handle_to_object(CK_OBJECT_HANDLE handle,
++			struct st_object **object)
++{
++    int i = HANDLE_OBJECT_ID(handle);
++
++    *object = NULL;
++    if (i >= soft_token.object.num_objs)
++	return CKR_ARGUMENTS_BAD;
++    if (soft_token.object.objs[i] == NULL)
++	return CKR_ARGUMENTS_BAD;
++    if (soft_token.object.objs[i]->object_handle != handle)
++	return CKR_ARGUMENTS_BAD;
++    *object = soft_token.object.objs[i];
++    return CKR_OK;
++}
++
++static int
++attributes_match(const struct st_object *obj,
++		 const CK_ATTRIBUTE *attributes,
++		 CK_ULONG num_attributes)
++{
++    CK_ULONG i;
++    int j;
++    st_logf("attributes_match: %ld\n", (unsigned long)OBJECT_ID(obj));
++
++    for (i = 0; i < num_attributes; i++) {
++	int match = 0;
++	for (j = 0; j < obj->num_attributes; j++) {
++	    if (attributes[i].type == obj->attrs[j].attribute.type &&
++		attributes[i].ulValueLen == obj->attrs[j].attribute.ulValueLen &&
++		memcmp(attributes[i].pValue, obj->attrs[j].attribute.pValue,
++		       attributes[i].ulValueLen) == 0) {
++		match = 1;
++		break;
++	    }
++	}
++	if (match == 0) {
++	    st_logf("type %d attribute have no match\n", attributes[i].type);
++	    return 0;
++	}
++    }
++    st_logf("attribute matches\n");
++    return 1;
++}
++
++static void
++print_attributes(const CK_ATTRIBUTE *attributes,
++		 CK_ULONG num_attributes)
++{
++    CK_ULONG i;
++
++    st_logf("find objects: attrs: %lu\n", (unsigned long)num_attributes);
++
++    for (i = 0; i < num_attributes; i++) {
++	st_logf("  type: ");
++	switch (attributes[i].type) {
++	case CKA_TOKEN: {
++	    CK_BBOOL *ck_true;
++	    if (attributes[i].ulValueLen != sizeof(CK_BBOOL)) {
++		application_error("token attribute wrong length\n");
++		break;
++	    }
++	    ck_true = attributes[i].pValue;
++	    st_logf("token: %s", *ck_true ? "TRUE" : "FALSE");
++	    break;
++	}
++	case CKA_CLASS: {
++	    CK_OBJECT_CLASS *class;
++	    if (attributes[i].ulValueLen != sizeof(CK_ULONG)) {
++		application_error("class attribute wrong length\n");
++		break;
++	    }
++	    class = attributes[i].pValue;
++	    st_logf("class ");
++	    switch (*class) {
++	    case CKO_CERTIFICATE:
++		st_logf("certificate");
++		break;
++	    case CKO_PUBLIC_KEY:
++		st_logf("public key");
++		break;
++	    case CKO_PRIVATE_KEY:
++		st_logf("private key");
++		break;
++	    case CKO_SECRET_KEY:
++		st_logf("secret key");
++		break;
++	    case CKO_DOMAIN_PARAMETERS:
++		st_logf("domain parameters");
++		break;
++	    default:
++		st_logf("[class %lx]", (long unsigned)*class);
++		break;
++	    }
++	    break;
++	}
++	case CKA_PRIVATE:
++	    st_logf("private");
++	    break;
++	case CKA_LABEL:
++	    st_logf("label");
++	    break;
++	case CKA_APPLICATION:
++	    st_logf("application");
++	    break;
++	case CKA_VALUE:
++	    st_logf("value");
++	    break;
++	case CKA_ID:
++	    st_logf("id");
++	    break;
++	default:
++	    st_logf("[unknown 0x%08lx]", (unsigned long)attributes[i].type);
++	    break;
++	}
++	st_logf("\n");
++    }
++}
++
++static struct st_object *
++add_st_object(void)
++{
++    struct st_object *o, **objs;
++    int i;
++
++    o = malloc(sizeof(*o));
++    if (o == NULL)
++	return NULL;
++    memset(o, 0, sizeof(*o));
++    o->attrs = NULL;
++    o->num_attributes = 0;
++
++    for (i = 0; i < soft_token.object.num_objs; i++) {
++	if (soft_token.object.objs == NULL) {
++	    soft_token.object.objs[i] = o;
++	    break;
++	}
++    }
++    if (i == soft_token.object.num_objs) {
++	objs = realloc(soft_token.object.objs,
++		       (soft_token.object.num_objs + 1) * sizeof(soft_token.object.objs[0]));
++	if (objs == NULL) {
++	    free(o);
++	    return NULL;
++	}
++	soft_token.object.objs = objs;
++	soft_token.object.objs[soft_token.object.num_objs++] = o;
++    }
++    soft_token.object.objs[i]->object_handle =
++	(random() & (~OBJECT_ID_MASK)) | i;
++
++    return o;
++}
++
++static CK_RV
++add_object_attribute(struct st_object *o,
++		     int secret,
++		     CK_ATTRIBUTE_TYPE type,
++		     CK_VOID_PTR pValue,
++		     CK_ULONG ulValueLen)
++{
++    struct st_attr *a;
++    int i;
++
++    i = o->num_attributes;
++    a = realloc(o->attrs, (i + 1) * sizeof(o->attrs[0]));
++    if (a == NULL)
++	return CKR_DEVICE_MEMORY;
++    o->attrs = a;
++    o->attrs[i].secret = secret;
++    o->attrs[i].attribute.type = type;
++    o->attrs[i].attribute.pValue = malloc(ulValueLen);
++    if (o->attrs[i].attribute.pValue == NULL && ulValueLen != 0)
++	return CKR_DEVICE_MEMORY;
++    memcpy(o->attrs[i].attribute.pValue, pValue, ulValueLen);
++    o->attrs[i].attribute.ulValueLen = ulValueLen;
++    o->num_attributes++;
++
++    return CKR_OK;
++}
++
++static CK_RV
++add_pubkey_info(struct st_object *o, CK_KEY_TYPE key_type, EVP_PKEY *key)
++{
++    switch (key_type) {
++    case CKK_RSA: {
++	CK_BYTE *modulus = NULL;
++	size_t modulus_len = 0;
++	CK_ULONG modulus_bits = 0;
++	CK_BYTE *exponent = NULL;
++	size_t exponent_len = 0;
++	RSA* rsa = NULL;
++	const BIGNUM *n = NULL, *e = NULL;
++
++	rsa = EVP_PKEY_get0_RSA(key);
++	RSA_get0_key(rsa, &n, &e, NULL);
++
++	modulus_bits = BN_num_bits(n);
++
++	modulus_len = BN_num_bytes(n);
++	modulus = malloc(modulus_len);
++	BN_bn2bin(n, modulus);
++
++	exponent_len = BN_num_bytes(e);
++	exponent = malloc(exponent_len);
++	BN_bn2bin(e, exponent);
++
++	add_object_attribute(o, 0, CKA_MODULUS, modulus, modulus_len);
++	add_object_attribute(o, 0, CKA_MODULUS_BITS,
++			     &modulus_bits, sizeof(modulus_bits));
++	add_object_attribute(o, 0, CKA_PUBLIC_EXPONENT,
++			     exponent, exponent_len);
++
++	RSA_set_method(rsa, RSA_PKCS1_OpenSSL());
++
++	free(modulus);
++	free(exponent);
++    }
++    default:
++	/* XXX */
++	break;
++    }
++    return CKR_OK;
++}
++
++
++static int
++pem_callback(char *buf, int num, int w, void *key)
++{
++    return -1;
++}
++
++
++static CK_RV
++add_certificate(char *label,
++		const char *cert_file,
++		const char *private_key_file,
++		char *id,
++		int anchor)
++{
++    struct st_object *o = NULL;
++    CK_BBOOL bool_true = CK_TRUE;
++    CK_BBOOL bool_false = CK_FALSE;
++    CK_OBJECT_CLASS c;
++    CK_CERTIFICATE_TYPE cert_type = CKC_X_509;
++    CK_KEY_TYPE key_type;
++    CK_MECHANISM_TYPE mech_type;
++    void *cert_data = NULL;
++    size_t cert_length;
++    void *subject_data = NULL;
++    size_t subject_length;
++    void *issuer_data = NULL;
++    size_t issuer_length;
++    void *serial_data = NULL;
++    size_t serial_length;
++    CK_RV ret = CKR_GENERAL_ERROR;
++    X509 *cert;
++    EVP_PKEY *public_key;
++
++    size_t id_len = strlen(id);
++
++    {
++	FILE *f;
++
++	f = fopen(cert_file, "r");
++	if (f == NULL) {
++	    st_logf("failed to open file %s\n", cert_file);
++	    return CKR_GENERAL_ERROR;
++	}
++
++	cert = PEM_read_X509(f, NULL, NULL, NULL);
++	fclose(f);
++	if (cert == NULL) {
++	    st_logf("failed reading PEM cert\n");
++	    return CKR_GENERAL_ERROR;
++	}
++
++	OPENSSL_ASN1_MALLOC_ENCODE(X509, cert_data, cert_length, cert, ret);
++	if (ret)
++	    goto out;
++
++	OPENSSL_ASN1_MALLOC_ENCODE(X509_NAME, issuer_data, issuer_length,
++				   X509_get_issuer_name(cert), ret);
++	if (ret)
++	    goto out;
++
++	OPENSSL_ASN1_MALLOC_ENCODE(X509_NAME, subject_data, subject_length,
++				   X509_get_subject_name(cert), ret);
++	if (ret)
++	    goto out;
++
++	OPENSSL_ASN1_MALLOC_ENCODE(ASN1_INTEGER, serial_data, serial_length,
++				   X509_get_serialNumber(cert), ret);
++	if (ret)
++	    goto out;
++
++    }
++
++    st_logf("done parsing, adding to internal structure\n");
++
++    o = add_st_object();
++    if (o == NULL) {
++	ret = CKR_DEVICE_MEMORY;
++	goto out;
++    }
++    o->type = STO_T_CERTIFICATE;
++    o->u.cert = cert;
++    public_key = X509_get_pubkey(o->u.cert);
++
++    switch (EVP_PKEY_base_id(public_key)) {
++    case EVP_PKEY_RSA:
++	key_type = CKK_RSA;
++	break;
++    case EVP_PKEY_DSA:
++	key_type = CKK_DSA;
++	break;
++    default:
++	/* XXX */
++	break;
++    }
++
++    c = CKO_CERTIFICATE;
++    add_object_attribute(o, 0, CKA_CLASS, &c, sizeof(c));
++    add_object_attribute(o, 0, CKA_TOKEN, &bool_true, sizeof(bool_true));
++    add_object_attribute(o, 0, CKA_PRIVATE, &bool_false, sizeof(bool_false));
++    add_object_attribute(o, 0, CKA_MODIFIABLE, &bool_false, sizeof(bool_false));
++    add_object_attribute(o, 0, CKA_LABEL, label, strlen(label));
++
++    add_object_attribute(o, 0, CKA_CERTIFICATE_TYPE, &cert_type, sizeof(cert_type));
++    add_object_attribute(o, 0, CKA_ID, id, id_len);
++
++    add_object_attribute(o, 0, CKA_SUBJECT, subject_data, subject_length);
++    add_object_attribute(o, 0, CKA_ISSUER, issuer_data, issuer_length);
++    add_object_attribute(o, 0, CKA_SERIAL_NUMBER, serial_data, serial_length);
++    add_object_attribute(o, 0, CKA_VALUE, cert_data, cert_length);
++    if (anchor)
++	add_object_attribute(o, 0, CKA_TRUSTED, &bool_true, sizeof(bool_true));
++    else
++	add_object_attribute(o, 0, CKA_TRUSTED, &bool_false, sizeof(bool_false));
++
++    st_logf("add cert ok: %lx\n", (unsigned long)OBJECT_ID(o));
++
++    o = add_st_object();
++    if (o == NULL) {
++	ret = CKR_DEVICE_MEMORY;
++	goto out;
++    }
++    o->type = STO_T_PUBLIC_KEY;
++    o->u.public_key = public_key;
++
++    c = CKO_PUBLIC_KEY;
++    add_object_attribute(o, 0, CKA_CLASS, &c, sizeof(c));
++    add_object_attribute(o, 0, CKA_TOKEN, &bool_true, sizeof(bool_true));
++    add_object_attribute(o, 0, CKA_PRIVATE, &bool_false, sizeof(bool_false));
++    add_object_attribute(o, 0, CKA_MODIFIABLE, &bool_false, sizeof(bool_false));
++    add_object_attribute(o, 0, CKA_LABEL, label, strlen(label));
++
++    add_object_attribute(o, 0, CKA_KEY_TYPE, &key_type, sizeof(key_type));
++    add_object_attribute(o, 0, CKA_ID, id, id_len);
++    add_object_attribute(o, 0, CKA_START_DATE, "", 1); /* XXX */
++    add_object_attribute(o, 0, CKA_END_DATE, "", 1); /* XXX */
++    add_object_attribute(o, 0, CKA_DERIVE, &bool_false, sizeof(bool_false));
++    add_object_attribute(o, 0, CKA_LOCAL, &bool_false, sizeof(bool_false));
++    mech_type = CKM_RSA_X_509;
++    add_object_attribute(o, 0, CKA_KEY_GEN_MECHANISM, &mech_type, sizeof(mech_type));
++
++    add_object_attribute(o, 0, CKA_SUBJECT, subject_data, subject_length);
++    add_object_attribute(o, 0, CKA_ENCRYPT, &bool_true, sizeof(bool_true));
++    add_object_attribute(o, 0, CKA_VERIFY, &bool_true, sizeof(bool_true));
++    add_object_attribute(o, 0, CKA_VERIFY_RECOVER, &bool_false, sizeof(bool_false));
++    add_object_attribute(o, 0, CKA_WRAP, &bool_true, sizeof(bool_true));
++    add_object_attribute(o, 0, CKA_TRUSTED, &bool_true, sizeof(bool_true));
++
++    add_pubkey_info(o, key_type, public_key);
++
++    st_logf("add key ok: %lx\n", (unsigned long)OBJECT_ID(o));
++
++    if (private_key_file) {
++	CK_FLAGS flags;
++	FILE *f;
++
++	o = add_st_object();
++	if (o == NULL) {
++	    ret = CKR_DEVICE_MEMORY;
++	    goto out;
++	}
++	o->type = STO_T_PRIVATE_KEY;
++	o->u.private_key.file = strdup(private_key_file);
++	o->u.private_key.key = NULL;
++
++	o->u.private_key.cert = cert;
++
++	c = CKO_PRIVATE_KEY;
++	add_object_attribute(o, 0, CKA_CLASS, &c, sizeof(c));
++	add_object_attribute(o, 0, CKA_TOKEN, &bool_true, sizeof(bool_true));
++	add_object_attribute(o, 0, CKA_PRIVATE, &bool_true, sizeof(bool_false));
++	add_object_attribute(o, 0, CKA_MODIFIABLE, &bool_false, sizeof(bool_false));
++	add_object_attribute(o, 0, CKA_LABEL, label, strlen(label));
++
++	add_object_attribute(o, 0, CKA_KEY_TYPE, &key_type, sizeof(key_type));
++	add_object_attribute(o, 0, CKA_ID, id, id_len);
++	add_object_attribute(o, 0, CKA_START_DATE, "", 1); /* XXX */
++	add_object_attribute(o, 0, CKA_END_DATE, "", 1); /* XXX */
++	add_object_attribute(o, 0, CKA_DERIVE, &bool_false, sizeof(bool_false));
++	add_object_attribute(o, 0, CKA_LOCAL, &bool_false, sizeof(bool_false));
++	mech_type = CKM_RSA_X_509;
++	add_object_attribute(o, 0, CKA_KEY_GEN_MECHANISM, &mech_type, sizeof(mech_type));
++
++	add_object_attribute(o, 0, CKA_SUBJECT, subject_data, subject_length);
++	add_object_attribute(o, 0, CKA_SENSITIVE, &bool_true, sizeof(bool_true));
++	add_object_attribute(o, 0, CKA_SECONDARY_AUTH, &bool_false, sizeof(bool_true));
++	flags = 0;
++	add_object_attribute(o, 0, CKA_AUTH_PIN_FLAGS, &flags, sizeof(flags));
++
++	add_object_attribute(o, 0, CKA_DECRYPT, &bool_true, sizeof(bool_true));
++	add_object_attribute(o, 0, CKA_SIGN, &bool_true, sizeof(bool_true));
++	add_object_attribute(o, 0, CKA_SIGN_RECOVER, &bool_false, sizeof(bool_false));
++	add_object_attribute(o, 0, CKA_UNWRAP, &bool_true, sizeof(bool_true));
++	add_object_attribute(o, 0, CKA_EXTRACTABLE, &bool_true, sizeof(bool_true));
++	add_object_attribute(o, 0, CKA_NEVER_EXTRACTABLE, &bool_false, sizeof(bool_false));
++
++	add_pubkey_info(o, key_type, public_key);
++
++	f = fopen(private_key_file, "r");
++	if (f == NULL) {
++	    st_logf("failed to open private key\n");
++	    return CKR_GENERAL_ERROR;
++	}
++
++	o->u.private_key.key = PEM_read_PrivateKey(f, NULL, pem_callback, NULL);
++	fclose(f);
++	if (o->u.private_key.key == NULL) {
++	    st_logf("failed to read private key a startup\n");
++	    /* don't bother with this failure for now,
++	       fix it at C_Login time */;
++	} else {
++	    /* XXX verify keytype */
++
++	    if (key_type == CKK_RSA) {
++		RSA *rsa = EVP_PKEY_get0_RSA(o->u.private_key.key);
++		RSA_set_method(rsa, RSA_PKCS1_OpenSSL());
++	    }
++
++	    if (X509_check_private_key(cert, o->u.private_key.key) != 1) {
++		EVP_PKEY_free(o->u.private_key.key);
++		o->u.private_key.key = NULL;
++		st_logf("private key doesn't verify\n");
++	    } else {
++		st_logf("private key usable\n");
++		soft_token.flags.login_done = 1;
++	    }
++	}
++    }
++
++    ret = CKR_OK;
++ out:
++    if (ret != CKR_OK) {
++	st_logf("something went wrong when adding cert!\n");
++
++	/* XXX wack o */;
++    }
++    free(cert_data);
++    free(serial_data);
++    free(issuer_data);
++    free(subject_data);
++
++    return ret;
++}
++
++static void
++find_object_final(struct session_state *state)
++{
++    if (state->find.attributes) {
++	CK_ULONG i;
++
++	for (i = 0; i < state->find.num_attributes; i++) {
++	    if (state->find.attributes[i].pValue)
++		free(state->find.attributes[i].pValue);
++	}
++	free(state->find.attributes);
++	state->find.attributes = NULL;
++	state->find.num_attributes = 0;
++	state->find.next_object = -1;
++    }
++}
++
++static void
++reset_crypto_state(struct session_state *state)
++{
++    state->encrypt_object = -1;
++    if (state->encrypt_mechanism)
++	free(state->encrypt_mechanism);
++    state->encrypt_mechanism = NULL_PTR;
++    state->decrypt_object = -1;
++    if (state->decrypt_mechanism)
++	free(state->decrypt_mechanism);
++    state->decrypt_mechanism = NULL_PTR;
++    state->sign_object = -1;
++    if (state->sign_mechanism)
++	free(state->sign_mechanism);
++    state->sign_mechanism = NULL_PTR;
++    state->verify_object = -1;
++    if (state->verify_mechanism)
++	free(state->verify_mechanism);
++    state->verify_mechanism = NULL_PTR;
++    state->digest_object = -1;
++}
++
++static void
++close_session(struct session_state *state)
++{
++    if (state->find.attributes) {
++	application_error("application didn't do C_FindObjectsFinal\n");
++	find_object_final(state);
++    }
++
++    state->session_handle = CK_INVALID_HANDLE;
++    soft_token.application = NULL_PTR;
++    soft_token.notify = NULL_PTR;
++    reset_crypto_state(state);
++}
++
++static const char *
++has_session(void)
++{
++    return soft_token.open_sessions > 0 ? "yes" : "no";
++}
++
++static void
++read_conf_file(const char *fn)
++{
++    char buf[1024], *cert, *key, *id, *label, *s, *p;
++    int anchor;
++    FILE *f;
++
++    f = fopen(fn, "r");
++    if (f == NULL) {
++	st_logf("can't open configuration file %s\n", fn);
++	return;
++    }
++
++    while(fgets(buf, sizeof(buf), f) != NULL) {
++	buf[strcspn(buf, "\n")] = '\0';
++
++	anchor = 0;
++
++	st_logf("line: %s\n", buf);
++
++	p = buf;
++	while (isspace(*p))
++	    p++;
++	if (*p == '#')
++	    continue;
++	while (isspace(*p))
++	    p++;
++
++	s = NULL;
++	id = strtok_r(p, "\t", &s);
++	if (id == NULL)
++	    continue;
++	label = strtok_r(NULL, "\t", &s);
++	if (label == NULL)
++	    continue;
++	cert = strtok_r(NULL, "\t", &s);
++	if (cert == NULL)
++	    continue;
++	key = strtok_r(NULL, "\t", &s);
++
++	/* XXX */
++	if (strcmp(id, "anchor") == 0) {
++	    id = "\x00\x00";
++	    anchor = 1;
++	}
++
++	st_logf("adding: %s\n", label);
++
++	add_certificate(label, cert, key, id, anchor);
++    }
++}
++
++static CK_RV
++func_not_supported(void)
++{
++    st_logf("function not supported\n");
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_Initialize(CK_VOID_PTR a)
++{
++    CK_C_INITIALIZE_ARGS_PTR args = a;
++    st_logf("Initialize\n");
++    size_t i;
++
++    OpenSSL_add_all_algorithms();
++    ERR_load_crypto_strings();
++
++    srandom(getpid() ^ time(NULL));
++
++    for (i = 0; i < MAX_NUM_SESSION; i++) {
++	soft_token.state[i].session_handle = CK_INVALID_HANDLE;
++	soft_token.state[i].find.attributes = NULL;
++	soft_token.state[i].find.num_attributes = 0;
++	soft_token.state[i].find.next_object = -1;
++	reset_crypto_state(&soft_token.state[i]);
++    }
++
++    soft_token.flags.hardware_slot = 1;
++    soft_token.flags.app_error_fatal = 0;
++    soft_token.flags.login_done = 0;
++
++    soft_token.object.objs = NULL;
++    soft_token.object.num_objs = 0;
++
++    soft_token.logfile = NULL;
++#if 1
++//     soft_token.logfile = stdout;
++#endif
++#if 0
++    soft_token.logfile = fopen("/tmp/log-pkcs11.txt", "a");
++#endif
++
++    if (a != NULL_PTR) {
++	st_logf("\tCreateMutex:\t%p\n", args->CreateMutex);
++	st_logf("\tDestroyMutext\t%p\n", args->DestroyMutex);
++	st_logf("\tLockMutext\t%p\n", args->LockMutex);
++	st_logf("\tUnlockMutext\t%p\n", args->UnlockMutex);
++	st_logf("\tFlags\t%04x\n", (unsigned int)args->flags);
++    }
++
++    {
++	char *fn = NULL, *home = NULL;
++
++	if (getuid() == geteuid()) {
++	    fn = getenv("SOFTPKCS11RC");
++	    if (fn)
++		fn = strdup(fn);
++	    home = getenv("HOME");
++	}
++	if (fn == NULL && home == NULL) {
++	    struct passwd *pw = getpwuid(getuid());
++	    if(pw != NULL)
++		home = pw->pw_dir;
++	}
++	if (fn == NULL) {
++	    if (home)
++		asprintf(&fn, "%s/.soft-token.rc", home);
++	    else
++		fn = strdup("/etc/soft-token.rc");
++	}
++
++	read_conf_file(fn);
++	free(fn);
++    }
++
++    return CKR_OK;
++}
++
++CK_RV
++C_Finalize(CK_VOID_PTR args)
++{
++    size_t i;
++
++    st_logf("Finalize\n");
++
++    for (i = 0; i < MAX_NUM_SESSION; i++) {
++	if (soft_token.state[i].session_handle != CK_INVALID_HANDLE) {
++	    application_error("application finalized without "
++			      "closing session\n");
++	    close_session(&soft_token.state[i]);
++	}
++    }
++
++    return CKR_OK;
++}
++
++CK_RV
++C_GetInfo(CK_INFO_PTR args)
++{
++    st_logf("GetInfo\n");
++
++    memset(args, 17, sizeof(*args));
++    args->cryptokiVersion.major = 2;
++    args->cryptokiVersion.minor = 10;
++    snprintf_fill((char *)args->manufacturerID,
++		  sizeof(args->manufacturerID),
++		  ' ',
++		  "SoftToken");
++    snprintf_fill((char *)args->libraryDescription,
++		  sizeof(args->libraryDescription), ' ',
++		  "SoftToken");
++    args->libraryVersion.major = 1;
++    args->libraryVersion.minor = 8;
++
++    return CKR_OK;
++}
++
++extern CK_FUNCTION_LIST funcs;
++
++CK_RV
++C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR ppFunctionList)
++{
++    *ppFunctionList = &funcs;
++    return CKR_OK;
++}
++
++CK_RV
++C_GetSlotList(CK_BBOOL tokenPresent,
++	      CK_SLOT_ID_PTR pSlotList,
++	      CK_ULONG_PTR   pulCount)
++{
++    st_logf("GetSlotList: %s\n",
++	    tokenPresent ? "tokenPresent" : "token not Present");
++    if (pSlotList)
++	pSlotList[0] = 1;
++    *pulCount = 1;
++    return CKR_OK;
++}
++
++CK_RV
++C_GetSlotInfo(CK_SLOT_ID slotID,
++	      CK_SLOT_INFO_PTR pInfo)
++{
++    st_logf("GetSlotInfo: slot: %d : %s\n", (int)slotID, has_session());
++
++    memset(pInfo, 18, sizeof(*pInfo));
++
++    if (slotID != 1)
++	return CKR_ARGUMENTS_BAD;
++
++    snprintf_fill((char *)pInfo->slotDescription,
++		  sizeof(pInfo->slotDescription),
++		  ' ',
++		  "SoftToken (slot)");
++    snprintf_fill((char *)pInfo->manufacturerID,
++		  sizeof(pInfo->manufacturerID),
++		  ' ',
++		  "SoftToken (slot)");
++    pInfo->flags = CKF_TOKEN_PRESENT;
++    if (soft_token.flags.hardware_slot)
++	pInfo->flags |= CKF_HW_SLOT;
++    pInfo->hardwareVersion.major = 1;
++    pInfo->hardwareVersion.minor = 0;
++    pInfo->firmwareVersion.major = 1;
++    pInfo->firmwareVersion.minor = 0;
++
++    return CKR_OK;
++}
++
++CK_RV
++C_GetTokenInfo(CK_SLOT_ID slotID,
++	       CK_TOKEN_INFO_PTR pInfo)
++{
++    st_logf("GetTokenInfo: %s\n", has_session());
++
++    memset(pInfo, 19, sizeof(*pInfo));
++
++    snprintf_fill((char *)pInfo->label,
++		  sizeof(pInfo->label),
++		  ' ',
++		  "SoftToken (token)");
++    snprintf_fill((char *)pInfo->manufacturerID,
++		  sizeof(pInfo->manufacturerID),
++		  ' ',
++		  "SoftToken (token)");
++    snprintf_fill((char *)pInfo->model,
++		  sizeof(pInfo->model),
++		  ' ',
++		  "SoftToken (token)");
++    snprintf_fill((char *)pInfo->serialNumber,
++		  sizeof(pInfo->serialNumber),
++		  ' ',
++		  "4711");
++    pInfo->flags =
++	CKF_TOKEN_INITIALIZED |
++	CKF_USER_PIN_INITIALIZED;
++
++    if (soft_token.flags.login_done == 0)
++	pInfo->flags |= CKF_LOGIN_REQUIRED;
++
++    /* CFK_RNG |
++       CKF_RESTORE_KEY_NOT_NEEDED |
++    */
++    pInfo->ulMaxSessionCount = MAX_NUM_SESSION;
++    pInfo->ulSessionCount = soft_token.open_sessions;
++    pInfo->ulMaxRwSessionCount = MAX_NUM_SESSION;
++    pInfo->ulRwSessionCount = soft_token.open_sessions;
++    pInfo->ulMaxPinLen = 1024;
++    pInfo->ulMinPinLen = 0;
++    pInfo->ulTotalPublicMemory = 4711;
++    pInfo->ulFreePublicMemory = 4712;
++    pInfo->ulTotalPrivateMemory = 4713;
++    pInfo->ulFreePrivateMemory = 4714;
++    pInfo->hardwareVersion.major = 2;
++    pInfo->hardwareVersion.minor = 0;
++    pInfo->firmwareVersion.major = 2;
++    pInfo->firmwareVersion.minor = 0;
++
++    return CKR_OK;
++}
++
++CK_RV
++C_GetMechanismList(CK_SLOT_ID slotID,
++		   CK_MECHANISM_TYPE_PTR pMechanismList,
++		   CK_ULONG_PTR pulCount)
++{
++    st_logf("GetMechanismList\n");
++
++    *pulCount = 2;
++    if (pMechanismList == NULL_PTR)
++	return CKR_OK;
++    pMechanismList[0] = CKM_RSA_X_509;
++    pMechanismList[1] = CKM_RSA_PKCS;
++
++    return CKR_OK;
++}
++
++CK_RV
++C_GetMechanismInfo(CK_SLOT_ID slotID,
++		   CK_MECHANISM_TYPE type,
++		   CK_MECHANISM_INFO_PTR pInfo)
++{
++    st_logf("GetMechanismInfo: slot %d type: %d\n",
++	    (int)slotID, (int)type);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_InitToken(CK_SLOT_ID slotID,
++	    CK_UTF8CHAR_PTR pPin,
++	    CK_ULONG ulPinLen,
++	    CK_UTF8CHAR_PTR pLabel)
++{
++    st_logf("InitToken: slot %d\n", (int)slotID);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_OpenSession(CK_SLOT_ID slotID,
++	      CK_FLAGS flags,
++	      CK_VOID_PTR pApplication,
++	      CK_NOTIFY Notify,
++	      CK_SESSION_HANDLE_PTR phSession)
++{
++    size_t i;
++
++    st_logf("OpenSession: slot: %d\n", (int)slotID);
++
++    if (soft_token.open_sessions == MAX_NUM_SESSION)
++	return CKR_SESSION_COUNT;
++
++    soft_token.application = pApplication;
++    soft_token.notify = Notify;
++
++    for (i = 0; i < MAX_NUM_SESSION; i++)
++	if (soft_token.state[i].session_handle == CK_INVALID_HANDLE)
++	    break;
++    if (i == MAX_NUM_SESSION)
++	abort();
++
++    soft_token.open_sessions++;
++
++    soft_token.state[i].session_handle =
++	(CK_SESSION_HANDLE)(random() & 0xfffff);
++    *phSession = soft_token.state[i].session_handle;
++
++    return CKR_OK;
++}
++
++CK_RV
++C_CloseSession(CK_SESSION_HANDLE hSession)
++{
++    struct session_state *state;
++    st_logf("CloseSession\n");
++
++    if (verify_session_handle(hSession, &state) != CKR_OK)
++	application_error("closed session not open");
++    else
++	close_session(state);
++
++    return CKR_OK;
++}
++
++CK_RV
++C_CloseAllSessions(CK_SLOT_ID slotID)
++{
++    size_t i;
++
++    st_logf("CloseAllSessions\n");
++
++    for (i = 0; i < MAX_NUM_SESSION; i++)
++	if (soft_token.state[i].session_handle != CK_INVALID_HANDLE)
++	    close_session(&soft_token.state[i]);
++
++    return CKR_OK;
++}
++
++CK_RV
++C_GetSessionInfo(CK_SESSION_HANDLE hSession,
++		 CK_SESSION_INFO_PTR pInfo)
++{
++    st_logf("GetSessionInfo\n");
++
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++
++    memset(pInfo, 20, sizeof(*pInfo));
++
++    pInfo->slotID = 1;
++    if (soft_token.flags.login_done)
++	pInfo->state = CKS_RO_USER_FUNCTIONS;
++    else
++	pInfo->state = CKS_RO_PUBLIC_SESSION;
++    pInfo->flags = CKF_SERIAL_SESSION;
++    pInfo->ulDeviceError = 0;
++
++    return CKR_OK;
++}
++
++CK_RV
++C_Login(CK_SESSION_HANDLE hSession,
++	CK_USER_TYPE userType,
++	CK_UTF8CHAR_PTR pPin,
++	CK_ULONG ulPinLen)
++{
++    char *pin = NULL;
++    int i;
++
++    st_logf("Login\n");
++
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++
++    if (pPin != NULL_PTR) {
++	asprintf(&pin, "%.*s", (int)ulPinLen, pPin);
++	st_logf("type: %d password: %s\n", (int)userType, pin);
++    }
++
++    for (i = 0; i < soft_token.object.num_objs; i++) {
++	struct st_object *o = soft_token.object.objs[i];
++	FILE *f;
++
++	if (o->type != STO_T_PRIVATE_KEY)
++	    continue;
++
++	if (o->u.private_key.key)
++	    continue;
++
++	f = fopen(o->u.private_key.file, "r");
++	if (f == NULL) {
++	    st_logf("can't open private file: %s\n", o->u.private_key.file);
++	    continue;
++	}
++
++	o->u.private_key.key = PEM_read_PrivateKey(f, NULL, NULL, pin);
++	fclose(f);
++	if (o->u.private_key.key == NULL) {
++	    st_logf("failed to read key: %s error: %s\n",
++		    o->u.private_key.file,
++		    ERR_error_string(ERR_get_error(), NULL));
++	    /* just ignore failure */;
++	    continue;
++	}
++
++	/* XXX check keytype */
++	RSA *rsa = EVP_PKEY_get0_RSA(o->u.private_key.key);
++	RSA_set_method(rsa, RSA_PKCS1_OpenSSL());
++
++	if (X509_check_private_key(o->u.private_key.cert, o->u.private_key.key) != 1) {
++	    EVP_PKEY_free(o->u.private_key.key);
++	    o->u.private_key.key = NULL;
++	    st_logf("private key %s doesn't verify\n", o->u.private_key.file);
++	    continue;
++	}
++
++	soft_token.flags.login_done = 1;
++    }
++    free(pin);
++
++    return soft_token.flags.login_done ? CKR_OK : CKR_PIN_INCORRECT;
++}
++
++CK_RV
++C_Logout(CK_SESSION_HANDLE hSession)
++{
++    st_logf("Logout\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_GetObjectSize(CK_SESSION_HANDLE hSession,
++		CK_OBJECT_HANDLE hObject,
++		CK_ULONG_PTR pulSize)
++{
++    st_logf("GetObjectSize\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_GetAttributeValue(CK_SESSION_HANDLE hSession,
++		    CK_OBJECT_HANDLE hObject,
++		    CK_ATTRIBUTE_PTR pTemplate,
++		    CK_ULONG ulCount)
++{
++    struct session_state *state;
++    struct st_object *obj;
++    CK_ULONG i;
++    CK_RV ret;
++    int j;
++
++    st_logf("GetAttributeValue: %lx\n",
++	    (unsigned long)HANDLE_OBJECT_ID(hObject));
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if ((ret = object_handle_to_object(hObject, &obj)) != CKR_OK) {
++	st_logf("object not found: %lx\n",
++		(unsigned long)HANDLE_OBJECT_ID(hObject));
++	return ret;
++    }
++
++    ret = CKR_OK;
++    for (i = 0; i < ulCount; i++) {
++	st_logf("	getting 0x%08lx\n", (unsigned long)pTemplate[i].type);
++	for (j = 0; j < obj->num_attributes; j++) {
++	    if (obj->attrs[j].secret) {
++		pTemplate[i].ulValueLen = (CK_ULONG)-1;
++		break;
++	    }
++	    if (pTemplate[i].type == obj->attrs[j].attribute.type) {
++		if (pTemplate[i].pValue != NULL_PTR && obj->attrs[j].secret == 0) {
++		    if (pTemplate[i].ulValueLen >= obj->attrs[j].attribute.ulValueLen)
++			memcpy(pTemplate[i].pValue, obj->attrs[j].attribute.pValue,
++			       obj->attrs[j].attribute.ulValueLen);
++		}
++		pTemplate[i].ulValueLen = obj->attrs[j].attribute.ulValueLen;
++		break;
++	    }
++	}
++	if (j == obj->num_attributes) {
++	    st_logf("key type: 0x%08lx not found\n", (unsigned long)pTemplate[i].type);
++	    pTemplate[i].ulValueLen = (CK_ULONG)-1;
++            ret = CKR_ATTRIBUTE_TYPE_INVALID;
++	}
++
++    }
++    return ret;
++}
++
++CK_RV
++C_FindObjectsInit(CK_SESSION_HANDLE hSession,
++		  CK_ATTRIBUTE_PTR pTemplate,
++		  CK_ULONG ulCount)
++{
++    struct session_state *state;
++
++    st_logf("FindObjectsInit\n");
++
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if (state->find.next_object != -1) {
++	application_error("application didn't do C_FindObjectsFinal\n");
++	find_object_final(state);
++    }
++    if (ulCount) {
++	CK_ULONG i;
++
++	print_attributes(pTemplate, ulCount);
++
++	state->find.attributes =
++	    calloc(1, ulCount * sizeof(state->find.attributes[0]));
++	if (state->find.attributes == NULL)
++	    return CKR_DEVICE_MEMORY;
++	for (i = 0; i < ulCount; i++) {
++	    state->find.attributes[i].pValue =
++		malloc(pTemplate[i].ulValueLen);
++	    if (state->find.attributes[i].pValue == NULL) {
++		find_object_final(state);
++		return CKR_DEVICE_MEMORY;
++	    }
++	    memcpy(state->find.attributes[i].pValue,
++		   pTemplate[i].pValue, pTemplate[i].ulValueLen);
++	    state->find.attributes[i].type = pTemplate[i].type;
++	    state->find.attributes[i].ulValueLen = pTemplate[i].ulValueLen;
++	}
++	state->find.num_attributes = ulCount;
++	state->find.next_object = 0;
++    } else {
++	st_logf("find all objects\n");
++	state->find.attributes = NULL;
++	state->find.num_attributes = 0;
++	state->find.next_object = 0;
++    }
++
++    return CKR_OK;
++}
++
++CK_RV
++C_FindObjects(CK_SESSION_HANDLE hSession,
++	      CK_OBJECT_HANDLE_PTR phObject,
++	      CK_ULONG ulMaxObjectCount,
++	      CK_ULONG_PTR pulObjectCount)
++{
++    struct session_state *state;
++    int i;
++
++    st_logf("FindObjects\n");
++
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if (state->find.next_object == -1) {
++	application_error("application didn't do C_FindObjectsInit\n");
++	return CKR_ARGUMENTS_BAD;
++    }
++    if (ulMaxObjectCount == 0) {
++	application_error("application asked for 0 objects\n");
++	return CKR_ARGUMENTS_BAD;
++    }
++    *pulObjectCount = 0;
++    for (i = state->find.next_object; i < soft_token.object.num_objs; i++) {
++	st_logf("FindObjects: %d\n", i);
++	state->find.next_object = i + 1;
++	if (attributes_match(soft_token.object.objs[i],
++			     state->find.attributes,
++			     state->find.num_attributes)) {
++	    *phObject++ = soft_token.object.objs[i]->object_handle;
++	    ulMaxObjectCount--;
++	    (*pulObjectCount)++;
++	    if (ulMaxObjectCount == 0)
++		break;
++	}
++    }
++    return CKR_OK;
++}
++
++CK_RV
++C_FindObjectsFinal(CK_SESSION_HANDLE hSession)
++{
++    struct session_state *state;
++
++    st_logf("FindObjectsFinal\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++    find_object_final(state);
++    return CKR_OK;
++}
++
++static CK_RV
++commonInit(CK_ATTRIBUTE *attr_match, int attr_match_len,
++	   const CK_MECHANISM_TYPE *mechs, int mechs_len,
++	   const CK_MECHANISM_PTR pMechanism, CK_OBJECT_HANDLE hKey,
++	   struct st_object **o)
++{
++    CK_RV ret;
++    int i;
++
++    *o = NULL;
++    if ((ret = object_handle_to_object(hKey, o)) != CKR_OK)
++	return ret;
++
++    ret = attributes_match(*o, attr_match, attr_match_len);
++    if (!ret) {
++	application_error("called commonInit on key that doesn't "
++			  "support required attr");
++	return CKR_ARGUMENTS_BAD;
++    }
++
++    for (i = 0; i < mechs_len; i++)
++	if (mechs[i] == pMechanism->mechanism)
++	    break;
++    if (i == mechs_len) {
++	application_error("called mech (%08lx) not supported\n",
++			  pMechanism->mechanism);
++	return CKR_ARGUMENTS_BAD;
++    }
++    return CKR_OK;
++}
++
++
++static CK_RV
++dup_mechanism(CK_MECHANISM_PTR *dup, const CK_MECHANISM_PTR pMechanism)
++{
++    CK_MECHANISM_PTR p;
++
++    p = malloc(sizeof(*p));
++    if (p == NULL)
++	return CKR_DEVICE_MEMORY;
++
++    if (*dup)
++	free(*dup);
++    *dup = p;
++    memcpy(p, pMechanism, sizeof(*p));
++
++    return CKR_OK;
++}
++
++
++CK_RV
++C_EncryptInit(CK_SESSION_HANDLE hSession,
++	      CK_MECHANISM_PTR pMechanism,
++	      CK_OBJECT_HANDLE hKey)
++{
++    struct session_state *state;
++    CK_MECHANISM_TYPE mechs[] = { CKM_RSA_PKCS, CKM_RSA_X_509 };
++    CK_BBOOL bool_true = CK_TRUE;
++    CK_ATTRIBUTE attr[] = {
++	{ CKA_ENCRYPT, &bool_true, sizeof(bool_true) }
++    };
++    struct st_object *o;
++    CK_RV ret;
++
++    st_logf("EncryptInit\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    ret = commonInit(attr, sizeof(attr)/sizeof(attr[0]),
++		     mechs, sizeof(mechs)/sizeof(mechs[0]),
++		     pMechanism, hKey, &o);
++    if (ret)
++	return ret;
++
++    ret = dup_mechanism(&state->encrypt_mechanism, pMechanism);
++    if (ret == CKR_OK)
++	state->encrypt_object = OBJECT_ID(o);
++
++    return ret;
++}
++
++CK_RV
++C_Encrypt(CK_SESSION_HANDLE hSession,
++	  CK_BYTE_PTR pData,
++	  CK_ULONG ulDataLen,
++	  CK_BYTE_PTR pEncryptedData,
++	  CK_ULONG_PTR pulEncryptedDataLen)
++{
++    struct session_state *state;
++    struct st_object *o;
++    void *buffer = NULL;
++    CK_RV ret;
++    RSA *rsa;
++    int padding, len, buffer_len, padding_len;
++
++    st_logf("Encrypt\n");
++
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if (state->encrypt_object == -1)
++	return CKR_ARGUMENTS_BAD;
++
++    o = soft_token.object.objs[state->encrypt_object];
++
++    if (o->u.public_key == NULL) {
++	st_logf("public key NULL\n");
++	return CKR_ARGUMENTS_BAD;
++    }
++
++    rsa = EVP_PKEY_get0_RSA(o->u.public_key);
++    if (rsa == NULL)
++	return CKR_ARGUMENTS_BAD;
++
++    RSA_blinding_off(rsa); /* XXX RAND is broken while running in mozilla ? */
++
++    buffer_len = RSA_size(rsa);
++
++    buffer = malloc(buffer_len);
++    if (buffer == NULL) {
++	ret = CKR_DEVICE_MEMORY;
++	goto out;
++    }
++
++    ret = CKR_OK;
++    switch(state->encrypt_mechanism->mechanism) {
++    case CKM_RSA_PKCS:
++	padding = RSA_PKCS1_PADDING;
++	padding_len = RSA_PKCS1_PADDING_SIZE;
++	break;
++    case CKM_RSA_X_509:
++	padding = RSA_NO_PADDING;
++	padding_len = 0;
++	break;
++    default:
++	ret = CKR_FUNCTION_NOT_SUPPORTED;
++	goto out;
++    }
++
++    if (buffer_len + padding_len < (long) ulDataLen) {
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pulEncryptedDataLen == NULL) {
++	st_logf("pulEncryptedDataLen NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pData == NULL_PTR) {
++	st_logf("data NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    len = RSA_public_encrypt(ulDataLen, pData, buffer, rsa, padding);
++    if (len <= 0) {
++	ret = CKR_DEVICE_ERROR;
++	goto out;
++    }
++    if (len > buffer_len)
++	abort();
++
++    if (pEncryptedData != NULL_PTR)
++	memcpy(pEncryptedData, buffer, len);
++    *pulEncryptedDataLen = len;
++
++ out:
++    if (buffer) {
++	memset(buffer, 0, buffer_len);
++	free(buffer);
++    }
++    return ret;
++}
++
++CK_RV
++C_EncryptUpdate(CK_SESSION_HANDLE hSession,
++		CK_BYTE_PTR pPart,
++		CK_ULONG ulPartLen,
++		CK_BYTE_PTR pEncryptedPart,
++		CK_ULONG_PTR pulEncryptedPartLen)
++{
++    st_logf("EncryptUpdate\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++
++CK_RV
++C_EncryptFinal(CK_SESSION_HANDLE hSession,
++	       CK_BYTE_PTR pLastEncryptedPart,
++	       CK_ULONG_PTR pulLastEncryptedPartLen)
++{
++    st_logf("EncryptFinal\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++
++/* C_DecryptInit initializes a decryption operation. */
++CK_RV
++C_DecryptInit(CK_SESSION_HANDLE hSession,
++	      CK_MECHANISM_PTR pMechanism,
++	      CK_OBJECT_HANDLE hKey)
++{
++    struct session_state *state;
++    CK_MECHANISM_TYPE mechs[] = { CKM_RSA_PKCS, CKM_RSA_X_509 };
++    CK_BBOOL bool_true = CK_TRUE;
++    CK_ATTRIBUTE attr[] = {
++	{ CKA_DECRYPT, &bool_true, sizeof(bool_true) }
++    };
++    struct st_object *o;
++    CK_RV ret;
++
++    st_logf("DecryptInit\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    ret = commonInit(attr, sizeof(attr)/sizeof(attr[0]),
++		     mechs, sizeof(mechs)/sizeof(mechs[0]),
++		     pMechanism, hKey, &o);
++    if (ret)
++	return ret;
++
++    ret = dup_mechanism(&state->decrypt_mechanism, pMechanism);
++    if (ret == CKR_OK)
++	state->decrypt_object = OBJECT_ID(o);
++
++    return CKR_OK;
++}
++
++
++CK_RV
++C_Decrypt(CK_SESSION_HANDLE hSession,
++	  CK_BYTE_PTR       pEncryptedData,
++	  CK_ULONG          ulEncryptedDataLen,
++	  CK_BYTE_PTR       pData,
++	  CK_ULONG_PTR      pulDataLen)
++{
++    struct session_state *state;
++    struct st_object *o;
++    void *buffer = NULL;
++    CK_RV ret;
++    RSA *rsa;
++    int padding, len, buffer_len, padding_len;
++
++    st_logf("Decrypt\n");
++
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if (state->decrypt_object == -1)
++	return CKR_ARGUMENTS_BAD;
++
++    o = soft_token.object.objs[state->decrypt_object];
++
++    if (o->u.private_key.key == NULL) {
++	st_logf("private key NULL\n");
++	return CKR_ARGUMENTS_BAD;
++    }
++
++    rsa = EVP_PKEY_get0_RSA(o->u.private_key.key);
++    if (rsa == NULL)
++	return CKR_ARGUMENTS_BAD;
++
++    RSA_blinding_off(rsa); /* XXX RAND is broken while running in mozilla ? */
++
++    buffer_len = RSA_size(rsa);
++
++    buffer = malloc(buffer_len);
++    if (buffer == NULL) {
++	ret = CKR_DEVICE_MEMORY;
++	goto out;
++    }
++
++    ret = CKR_OK;
++    switch(state->decrypt_mechanism->mechanism) {
++    case CKM_RSA_PKCS:
++	padding = RSA_PKCS1_PADDING;
++	padding_len = RSA_PKCS1_PADDING_SIZE;
++	break;
++    case CKM_RSA_X_509:
++	padding = RSA_NO_PADDING;
++	padding_len = 0;
++	break;
++    default:
++	ret = CKR_FUNCTION_NOT_SUPPORTED;
++	goto out;
++    }
++
++    if (buffer_len + padding_len < (long) ulEncryptedDataLen) {
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pulDataLen == NULL) {
++	st_logf("pulDataLen NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pEncryptedData == NULL_PTR) {
++	st_logf("data NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    len = RSA_private_decrypt(ulEncryptedDataLen, pEncryptedData, buffer,
++			      rsa, padding);
++    if (len <= 0) {
++	ret = CKR_DEVICE_ERROR;
++	goto out;
++    }
++    if (len > buffer_len)
++	abort();
++
++    if (pData != NULL_PTR)
++	memcpy(pData, buffer, len);
++    *pulDataLen = len;
++
++ out:
++    if (buffer) {
++	memset(buffer, 0, buffer_len);
++	free(buffer);
++    }
++    return ret;
++}
++
++
++CK_RV
++C_DecryptUpdate(CK_SESSION_HANDLE hSession,
++		CK_BYTE_PTR pEncryptedPart,
++		CK_ULONG ulEncryptedPartLen,
++		CK_BYTE_PTR pPart,
++		CK_ULONG_PTR pulPartLen)
++
++{
++    st_logf("DecryptUpdate\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++
++CK_RV
++C_DecryptFinal(CK_SESSION_HANDLE hSession,
++	       CK_BYTE_PTR pLastPart,
++	       CK_ULONG_PTR pulLastPartLen)
++{
++    st_logf("DecryptFinal\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_DigestInit(CK_SESSION_HANDLE hSession,
++	     CK_MECHANISM_PTR pMechanism)
++{
++    st_logf("DigestInit\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_SignInit(CK_SESSION_HANDLE hSession,
++	   CK_MECHANISM_PTR pMechanism,
++	   CK_OBJECT_HANDLE hKey)
++{
++    struct session_state *state;
++    CK_MECHANISM_TYPE mechs[] = { CKM_RSA_PKCS, CKM_RSA_X_509 };
++    CK_BBOOL bool_true = CK_TRUE;
++    CK_ATTRIBUTE attr[] = {
++	{ CKA_SIGN, &bool_true, sizeof(bool_true) }
++    };
++    struct st_object *o;
++    CK_RV ret;
++
++    st_logf("SignInit\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    ret = commonInit(attr, sizeof(attr)/sizeof(attr[0]),
++		     mechs, sizeof(mechs)/sizeof(mechs[0]),
++		     pMechanism, hKey, &o);
++    if (ret)
++	return ret;
++
++    ret = dup_mechanism(&state->sign_mechanism, pMechanism);
++    if (ret == CKR_OK)
++	state->sign_object = OBJECT_ID(o);
++
++    return CKR_OK;
++}
++
++CK_RV
++C_Sign(CK_SESSION_HANDLE hSession,
++       CK_BYTE_PTR pData,
++       CK_ULONG ulDataLen,
++       CK_BYTE_PTR pSignature,
++       CK_ULONG_PTR pulSignatureLen)
++{
++    struct session_state *state;
++    struct st_object *o;
++    void *buffer = NULL;
++    CK_RV ret;
++    RSA *rsa;
++    int padding, len, buffer_len;
++    size_t padding_len;
++
++    st_logf("Sign\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if (state->sign_object == -1)
++	return CKR_ARGUMENTS_BAD;
++
++    o = soft_token.object.objs[state->sign_object];
++
++    if (o->u.private_key.key == NULL) {
++	st_logf("private key NULL\n");
++	return CKR_ARGUMENTS_BAD;
++    }
++
++    rsa = EVP_PKEY_get0_RSA(o->u.private_key.key);
++    if (rsa == NULL)
++	return CKR_ARGUMENTS_BAD;
++
++    RSA_blinding_off(rsa); /* XXX RAND is broken while running in mozilla ? */
++
++    buffer_len = RSA_size(rsa);
++
++    buffer = malloc(buffer_len);
++    if (buffer == NULL) {
++	ret = CKR_DEVICE_MEMORY;
++	goto out;
++    }
++
++    switch(state->sign_mechanism->mechanism) {
++    case CKM_RSA_PKCS:
++	padding = RSA_PKCS1_PADDING;
++	padding_len = RSA_PKCS1_PADDING_SIZE;
++	break;
++    case CKM_RSA_X_509:
++	padding = RSA_NO_PADDING;
++	padding_len = 0;
++	break;
++    default:
++	ret = CKR_FUNCTION_NOT_SUPPORTED;
++	goto out;
++    }
++
++    if ((size_t) buffer_len < ulDataLen + padding_len) {
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pulSignatureLen == NULL) {
++	st_logf("signature len NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pData == NULL_PTR) {
++	st_logf("data NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    len = RSA_private_encrypt(ulDataLen, pData, buffer, rsa, padding);
++    st_logf("private encrypt done\n");
++    if (len <= 0) {
++	ret = CKR_DEVICE_ERROR;
++	goto out;
++    }
++    if (len > buffer_len)
++	abort();
++
++    if (pSignature != NULL_PTR)
++	memcpy(pSignature, buffer, len);
++    *pulSignatureLen = len;
++
++    ret = CKR_OK;
++
++ out:
++    if (buffer) {
++	memset(buffer, 0, buffer_len);
++	free(buffer);
++    }
++    return ret;
++}
++
++CK_RV
++C_SignUpdate(CK_SESSION_HANDLE hSession,
++	     CK_BYTE_PTR pPart,
++	     CK_ULONG ulPartLen)
++{
++    st_logf("SignUpdate\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++
++CK_RV
++C_SignFinal(CK_SESSION_HANDLE hSession,
++	    CK_BYTE_PTR pSignature,
++	    CK_ULONG_PTR pulSignatureLen)
++{
++    st_logf("SignUpdate\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_VerifyInit(CK_SESSION_HANDLE hSession,
++	     CK_MECHANISM_PTR pMechanism,
++	     CK_OBJECT_HANDLE hKey)
++{
++    struct session_state *state;
++    CK_MECHANISM_TYPE mechs[] = { CKM_RSA_PKCS, CKM_RSA_X_509 };
++    CK_BBOOL bool_true = CK_TRUE;
++    CK_ATTRIBUTE attr[] = {
++	{ CKA_VERIFY, &bool_true, sizeof(bool_true) }
++    };
++    struct st_object *o;
++    CK_RV ret;
++
++    st_logf("VerifyInit\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    ret = commonInit(attr, sizeof(attr)/sizeof(attr[0]),
++		     mechs, sizeof(mechs)/sizeof(mechs[0]),
++		     pMechanism, hKey, &o);
++    if (ret)
++	return ret;
++
++    ret = dup_mechanism(&state->verify_mechanism, pMechanism);
++    if (ret == CKR_OK)
++	state->verify_object = OBJECT_ID(o);
++
++    return ret;
++}
++
++CK_RV
++C_Verify(CK_SESSION_HANDLE hSession,
++	 CK_BYTE_PTR pData,
++	 CK_ULONG ulDataLen,
++	 CK_BYTE_PTR pSignature,
++	 CK_ULONG ulSignatureLen)
++{
++    struct session_state *state;
++    struct st_object *o;
++    void *buffer = NULL;
++    CK_RV ret;
++    RSA *rsa;
++    int padding, len, buffer_len;
++
++    st_logf("Verify\n");
++    VERIFY_SESSION_HANDLE(hSession, &state);
++
++    if (state->verify_object == -1)
++	return CKR_ARGUMENTS_BAD;
++
++    o = soft_token.object.objs[state->verify_object];
++
++    if (o->u.public_key == NULL) {
++	st_logf("public key NULL\n");
++	return CKR_ARGUMENTS_BAD;
++    }
++
++    rsa = EVP_PKEY_get0_RSA(o->u.public_key);
++    if (rsa == NULL)
++	return CKR_ARGUMENTS_BAD;
++
++    RSA_blinding_off(rsa); /* XXX RAND is broken while running in mozilla ? */
++
++    buffer_len = RSA_size(rsa);
++
++    buffer = malloc(buffer_len);
++    if (buffer == NULL) {
++	ret = CKR_DEVICE_MEMORY;
++	goto out;
++    }
++
++    ret = CKR_OK;
++    switch(state->verify_mechanism->mechanism) {
++    case CKM_RSA_PKCS:
++	padding = RSA_PKCS1_PADDING;
++	break;
++    case CKM_RSA_X_509:
++	padding = RSA_NO_PADDING;
++	break;
++    default:
++	ret = CKR_FUNCTION_NOT_SUPPORTED;
++	goto out;
++    }
++
++    if (buffer_len < (long) ulDataLen) {
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pSignature == NULL) {
++	st_logf("signature NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    if (pData == NULL_PTR) {
++	st_logf("data NULL\n");
++	ret = CKR_ARGUMENTS_BAD;
++	goto out;
++    }
++
++    len = RSA_public_decrypt(ulDataLen, pData, buffer, rsa, padding);
++    st_logf("private encrypt done\n");
++    if (len <= 0) {
++	ret = CKR_DEVICE_ERROR;
++	goto out;
++    }
++    if (len > buffer_len)
++	abort();
++
++    if ((size_t) len != ulSignatureLen) {
++	ret = CKR_GENERAL_ERROR;
++	goto out;
++    }
++
++    if (memcmp(pSignature, buffer, len) != 0) {
++	ret = CKR_GENERAL_ERROR;
++	goto out;
++    }
++
++ out:
++    if (buffer) {
++	memset(buffer, 0, buffer_len);
++	free(buffer);
++    }
++    return ret;
++}
++
++
++CK_RV
++C_VerifyUpdate(CK_SESSION_HANDLE hSession,
++	       CK_BYTE_PTR pPart,
++	       CK_ULONG ulPartLen)
++{
++    st_logf("VerifyUpdate\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_VerifyFinal(CK_SESSION_HANDLE hSession,
++	      CK_BYTE_PTR pSignature,
++	      CK_ULONG ulSignatureLen)
++{
++    st_logf("VerifyFinal\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++CK_RV
++C_GenerateRandom(CK_SESSION_HANDLE hSession,
++		 CK_BYTE_PTR RandomData,
++		 CK_ULONG ulRandomLen)
++{
++    st_logf("GenerateRandom\n");
++    VERIFY_SESSION_HANDLE(hSession, NULL);
++    return CKR_FUNCTION_NOT_SUPPORTED;
++}
++
++
++CK_FUNCTION_LIST funcs = {
++    { 2, 11 },
++    C_Initialize,
++    C_Finalize,
++    C_GetInfo,
++    C_GetFunctionList,
++    C_GetSlotList,
++    C_GetSlotInfo,
++    C_GetTokenInfo,
++    C_GetMechanismList,
++    C_GetMechanismInfo,
++    C_InitToken,
++    (void *)func_not_supported, /* C_InitPIN */
++    (void *)func_not_supported, /* C_SetPIN */
++    C_OpenSession,
++    C_CloseSession,
++    C_CloseAllSessions,
++    C_GetSessionInfo,
++    (void *)func_not_supported, /* C_GetOperationState */
++    (void *)func_not_supported, /* C_SetOperationState */
++    C_Login,
++    C_Logout,
++    (void *)func_not_supported, /* C_CreateObject */
++    (void *)func_not_supported, /* C_CopyObject */
++    (void *)func_not_supported, /* C_DestroyObject */
++    (void *)func_not_supported, /* C_GetObjectSize */
++    C_GetAttributeValue,
++    (void *)func_not_supported, /* C_SetAttributeValue */
++    C_FindObjectsInit,
++    C_FindObjects,
++    C_FindObjectsFinal,
++    C_EncryptInit,
++    C_Encrypt,
++    C_EncryptUpdate,
++    C_EncryptFinal,
++    C_DecryptInit,
++    C_Decrypt,
++    C_DecryptUpdate,
++    C_DecryptFinal,
++    C_DigestInit,
++    (void *)func_not_supported, /* C_Digest */
++    (void *)func_not_supported, /* C_DigestUpdate */
++    (void *)func_not_supported, /* C_DigestKey */
++    (void *)func_not_supported, /* C_DigestFinal */
++    C_SignInit,
++    C_Sign,
++    C_SignUpdate,
++    C_SignFinal,
++    (void *)func_not_supported, /* C_SignRecoverInit */
++    (void *)func_not_supported, /* C_SignRecover */
++    C_VerifyInit,
++    C_Verify,
++    C_VerifyUpdate,
++    C_VerifyFinal,
++    (void *)func_not_supported, /* C_VerifyRecoverInit */
++    (void *)func_not_supported, /* C_VerifyRecover */
++    (void *)func_not_supported, /* C_DigestEncryptUpdate */
++    (void *)func_not_supported, /* C_DecryptDigestUpdate */
++    (void *)func_not_supported, /* C_SignEncryptUpdate */
++    (void *)func_not_supported, /* C_DecryptVerifyUpdate */
++    (void *)func_not_supported, /* C_GenerateKey */
++    (void *)func_not_supported, /* C_GenerateKeyPair */
++    (void *)func_not_supported, /* C_WrapKey */
++    (void *)func_not_supported, /* C_UnwrapKey */
++    (void *)func_not_supported, /* C_DeriveKey */
++    (void *)func_not_supported, /* C_SeedRandom */
++    C_GenerateRandom,
++    (void *)func_not_supported, /* C_GetFunctionStatus */
++    (void *)func_not_supported, /* C_CancelFunction */
++    (void *)func_not_supported  /* C_WaitForSlotEvent */
++};
+diff --git a/regress/unittests/Makefile b/regress/unittests/Makefile
+index e464b085..a0e5a37c 100644
+--- a/regress/unittests/Makefile
++++ b/regress/unittests/Makefile
+@@ -2,6 +2,6 @@
+ 
+ REGRESS_FAIL_EARLY?=	yes
+ SUBDIR=	test_helper sshbuf sshkey bitmap kex hostkeys utf8 match conversion
+-SUBDIR+=authopt
++SUBDIR+=pkcs11 authopt
+ 
+ .include <bsd.subdir.mk>
+diff --git a/regress/unittests/pkcs11/tests.c b/regress/unittests/pkcs11/tests.c
+new file mode 100644
+index 00000000..e910c87b
+--- /dev/null
++++ b/regress/unittests/pkcs11/tests.c
+@@ -0,0 +1,330 @@
++/*
++ * Copyright (c) 2017 Red Hat
++ *
++ * Authors: Jakub Jelen <jjelen@redhat.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include "includes.h"
++
++#include <locale.h>
++#include <string.h>
++
++#include "../test_helper/test_helper.h"
++
++#include "sshbuf.h"
++#include "ssh-pkcs11-uri.h"
++
++#define EMPTY_URI compose_uri(NULL, 0, NULL, NULL, NULL, NULL, NULL)
++
++/* prototypes are not public -- specify them here internally for tests */
++struct sshbuf *percent_encode(const char *, size_t, char *);
++int percent_decode(char *, char **);
++
++void
++compare_uri(struct pkcs11_uri *a, struct pkcs11_uri *b)
++{
++	ASSERT_PTR_NE(a, NULL);
++	ASSERT_PTR_NE(b, NULL);
++	ASSERT_SIZE_T_EQ(a->id_len, b->id_len);
++	ASSERT_MEM_EQ(a->id, b->id, a->id_len);
++	if (b->object != NULL)
++		ASSERT_STRING_EQ(a->object, b->object);
++	else /* both should be null */
++		ASSERT_PTR_EQ(a->object, b->object);
++	if (b->module_path != NULL)
++		ASSERT_STRING_EQ(a->module_path, b->module_path);
++	else /* both should be null */
++		ASSERT_PTR_EQ(a->module_path, b->module_path);
++	if (b->token != NULL)
++		ASSERT_STRING_EQ(a->token, b->token);
++	else /* both should be null */
++		ASSERT_PTR_EQ(a->token, b->token);
++	if (b->manuf != NULL)
++		ASSERT_STRING_EQ(a->manuf, b->manuf);
++	else /* both should be null */
++		ASSERT_PTR_EQ(a->manuf, b->manuf);
++	if (b->lib_manuf != NULL)
++		ASSERT_STRING_EQ(a->lib_manuf, b->lib_manuf);
++	else /* both should be null */
++		ASSERT_PTR_EQ(a->lib_manuf, b->lib_manuf);
++}
++
++void
++check_parse_rv(char *uri, struct pkcs11_uri *expect, int expect_rv)
++{
++	char *buf = NULL, *str;
++	struct pkcs11_uri *pkcs11uri = NULL;
++	int rv;
++
++	if (expect_rv == 0)
++		str = "Valid";
++	else
++		str = "Invalid";
++	asprintf(&buf, "%s PKCS#11 URI parsing: %s", str, uri);
++	TEST_START(buf);
++	free(buf);
++	pkcs11uri = pkcs11_uri_init();
++	rv = pkcs11_uri_parse(uri, pkcs11uri);
++	ASSERT_INT_EQ(rv, expect_rv);
++	if (rv == 0) /* in case of failure result is undefined */
++		compare_uri(pkcs11uri, expect);
++	pkcs11_uri_cleanup(pkcs11uri);
++	free(expect);
++	TEST_DONE();
++}
++
++void
++check_parse(char *uri, struct pkcs11_uri *expect)
++{
++	check_parse_rv(uri, expect, 0);
++}
++
++struct pkcs11_uri *
++compose_uri(unsigned char *id, size_t id_len, char *token, char *lib_manuf,
++    char *manuf, char *module_path, char *object)
++{
++	struct pkcs11_uri *uri = pkcs11_uri_init();
++	if (id_len > 0) {
++		uri->id_len = id_len;
++		uri->id = id;
++	}
++	uri->module_path = module_path;
++	uri->token = token;
++	uri->lib_manuf = lib_manuf;
++	uri->manuf = manuf;
++	uri->object = object;
++	return uri;
++}
++
++static void
++test_parse_valid(void)
++{
++	/* path arguments */
++	check_parse("pkcs11:id=%01",
++	    compose_uri("\x01", 1, NULL, NULL, NULL, NULL, NULL));
++	check_parse("pkcs11:id=%00%01",
++	    compose_uri("\x00\x01", 2, NULL, NULL, NULL, NULL, NULL));
++	check_parse("pkcs11:token=SSH%20Keys",
++	    compose_uri(NULL, 0, "SSH Keys", NULL, NULL, NULL, NULL));
++	check_parse("pkcs11:library-manufacturer=OpenSC",
++	    compose_uri(NULL, 0, NULL, "OpenSC", NULL, NULL, NULL));
++	check_parse("pkcs11:manufacturer=piv_II",
++	    compose_uri(NULL, 0, NULL, NULL, "piv_II", NULL, NULL));
++	check_parse("pkcs11:object=SIGN%20Key",
++	    compose_uri(NULL, 0, NULL, NULL, NULL, NULL, "SIGN Key"));
++	/* query arguments */
++	check_parse("pkcs11:?module-path=/usr/lib64/p11-kit-proxy.so",
++	    compose_uri(NULL, 0, NULL, NULL, NULL, "/usr/lib64/p11-kit-proxy.so", NULL));
++
++	/* combinations */
++	/* ID SHOULD be percent encoded */
++	check_parse("pkcs11:token=SSH%20Key;id=0",
++	    compose_uri("0", 1, "SSH Key", NULL, NULL, NULL, NULL));
++	check_parse(
++	    "pkcs11:manufacturer=CAC?module-path=/usr/lib64/p11-kit-proxy.so",
++	    compose_uri(NULL, 0, NULL, NULL, "CAC",
++	    "/usr/lib64/p11-kit-proxy.so", NULL));
++	check_parse(
++	    "pkcs11:object=RSA%20Key?module-path=/usr/lib64/pkcs11/opencryptoki.so",
++	    compose_uri(NULL, 0, NULL, NULL, NULL,
++	    "/usr/lib64/pkcs11/opencryptoki.so", "RSA Key"));
++
++	/* empty path component matches everything */
++	check_parse("pkcs11:", EMPTY_URI);
++
++	/* empty string is a valid to match against (and different from NULL) */
++	check_parse("pkcs11:token=",
++	    compose_uri(NULL, 0, "", NULL, NULL, NULL, NULL));
++	/* Percent character needs to be percent-encoded */
++	check_parse("pkcs11:token=%25",
++	     compose_uri(NULL, 0, "%", NULL, NULL, NULL, NULL));
++}
++
++static void
++test_parse_invalid(void)
++{
++	/* Invalid percent encoding */
++	check_parse_rv("pkcs11:id=%0", EMPTY_URI, -1);
++	/* Invalid percent encoding */
++	check_parse_rv("pkcs11:id=%ZZ", EMPTY_URI, -1);
++	/* Space MUST be percent encoded -- XXX not enforced yet */
++	check_parse("pkcs11:token=SSH Keys",
++	    compose_uri(NULL, 0, "SSH Keys", NULL, NULL, NULL, NULL));
++	/* MUST NOT contain duplicate attributes of the same name */
++	check_parse_rv("pkcs11:id=%01;id=%02", EMPTY_URI, -1);
++	/* Unrecognized attribute in path are ignored with log message */
++	check_parse("pkcs11:key_name=SSH", EMPTY_URI);
++	/* Unrecognized attribute in query SHOULD be ignored */
++	check_parse("pkcs11:?key_name=SSH", EMPTY_URI);
++}
++
++void
++check_gen(char *expect, struct pkcs11_uri *uri)
++{
++	char *buf = NULL, *uri_str;
++
++	asprintf(&buf, "Valid PKCS#11 URI generation: %s", expect);
++	TEST_START(buf);
++	free(buf);
++	uri_str = pkcs11_uri_get(uri);
++	ASSERT_PTR_NE(uri_str, NULL);
++	ASSERT_STRING_EQ(uri_str, expect);
++	free(uri_str);
++	TEST_DONE();
++}
++
++static void
++test_generate_valid(void)
++{
++	/* path arguments */
++	check_gen("pkcs11:id=%01",
++	    compose_uri("\x01", 1, NULL, NULL, NULL, NULL, NULL));
++	check_gen("pkcs11:id=%00%01",
++	    compose_uri("\x00\x01", 2, NULL, NULL, NULL, NULL, NULL));
++	check_gen("pkcs11:token=SSH%20Keys", /* space must be percent encoded */
++	    compose_uri(NULL, 0, "SSH Keys", NULL, NULL, NULL, NULL));
++	/* library-manufacturer is not implmented now */
++	/*check_gen("pkcs11:library-manufacturer=OpenSC",
++	    compose_uri(NULL, 0, NULL, "OpenSC", NULL, NULL, NULL));*/
++	check_gen("pkcs11:manufacturer=piv_II",
++	    compose_uri(NULL, 0, NULL, NULL, "piv_II", NULL, NULL));
++	check_gen("pkcs11:object=RSA%20Key",
++	    compose_uri(NULL, 0, NULL, NULL, NULL, NULL, "RSA Key"));
++	/* query arguments */
++	check_gen("pkcs11:?module-path=/usr/lib64/p11-kit-proxy.so",
++	    compose_uri(NULL, 0, NULL, NULL, NULL, "/usr/lib64/p11-kit-proxy.so", NULL));
++
++	/* combinations */
++	check_gen("pkcs11:id=%02;token=SSH%20Keys",
++	    compose_uri("\x02", 1, "SSH Keys", NULL, NULL, NULL, NULL));
++	check_gen("pkcs11:id=%EE%02?module-path=/usr/lib64/p11-kit-proxy.so",
++	    compose_uri("\xEE\x02", 2, NULL, NULL, NULL, "/usr/lib64/p11-kit-proxy.so", NULL));
++	check_gen("pkcs11:object=Encryption%20Key;manufacturer=piv_II",
++	    compose_uri(NULL, 0, NULL, NULL, "piv_II", NULL, "Encryption Key"));
++
++	/* empty path component matches everything */
++	check_gen("pkcs11:", EMPTY_URI);
++
++}
++
++void
++check_encode(char *source, size_t len, char *whitelist, char *expect)
++{
++	char *buf = NULL;
++	struct sshbuf *b;
++
++	asprintf(&buf, "percent_encode: expected %s", expect);
++	TEST_START(buf);
++	free(buf);
++
++	b = percent_encode(source, len, whitelist);
++	ASSERT_STRING_EQ(sshbuf_ptr(b), expect);
++	sshbuf_free(b);
++	TEST_DONE();
++}
++
++static void
++test_percent_encode_multibyte(void)
++{
++	/* SHOULD be encoded as octets according to the UTF-8 character encoding */
++
++	/* multi-byte characters are "for free" */
++	check_encode("$", 1, "", "%24");
++	check_encode("¢", 2, "", "%C2%A2");
++	check_encode("€", 3, "", "%E2%82%AC");
++	check_encode("𐍈", 4, "", "%F0%90%8D%88");
++
++	/* CK_UTF8CHAR is unsigned char (1 byte) */
++	/* labels SHOULD be normalized to NFC [UAX15] */
++
++}
++
++static void
++test_percent_encode(void)
++{
++	/* Without whitelist encodes everything (for CKA_ID) */
++	check_encode("A*", 2, "", "%41%2A");
++	check_encode("\x00", 1, "", "%00");
++	check_encode("\x7F", 1, "", "%7F");
++	check_encode("\x80", 1, "", "%80");
++	check_encode("\xff", 1, "", "%FF");
++
++	/* Default whitelist encodes anything but safe letters */
++	check_encode("test" "\x00" "0alpha", 11, PKCS11_URI_WHITELIST,
++	    "test%000alpha");
++	check_encode(" ", 1, PKCS11_URI_WHITELIST,
++	    "%20"); /* Space MUST be percent encoded */
++	check_encode("/", 1, PKCS11_URI_WHITELIST,
++	    "%2F"); /* '/' delimiter MUST be percent encoded (in the path) */
++	check_encode("?", 1, PKCS11_URI_WHITELIST,
++	    "%3F"); /* delimiter '?' MUST be percent encoded (in the path) */
++	check_encode("#", 1, PKCS11_URI_WHITELIST,
++	    "%23"); /* '#' MUST be always percent encoded */
++	check_encode("key=value;separator?query&amp;#anch", 35, PKCS11_URI_WHITELIST,
++	    "key%3Dvalue%3Bseparator%3Fquery%26amp%3B%23anch");
++
++	/* Components in query can have '/' unencoded (useful for paths) */
++	check_encode("/path/to.file", 13, PKCS11_URI_WHITELIST "/",
++	    "/path/to.file");
++}
++
++void
++check_decode(char *source, char *expect, int expect_len)
++{
++	char *buf = NULL, *out = NULL;
++	int rv;
++
++	asprintf(&buf, "percent_decode: %s", source);
++	TEST_START(buf);
++	free(buf);
++
++	rv = percent_decode(source, &out);
++	ASSERT_INT_EQ(rv, expect_len);
++	if (rv >= 0)
++		ASSERT_MEM_EQ(out, expect, expect_len);
++	free(out);
++	TEST_DONE();
++}
++
++static void
++test_percent_decode(void)
++{
++	/* simple valid cases */
++	check_decode("%00", "\x00", 1);
++	check_decode("%FF", "\xFF", 1);
++
++	/* normal strings shold be kept intact */
++	check_decode("strings are left", "strings are left", 16);
++	check_decode("10%25 of trees", "10% of trees", 12);
++
++	/* make sure no more than 2 bytes are parsed */
++	check_decode("%222", "\x22" "2", 2);
++
++	/* invalid expects failure */
++	check_decode("%0", "", -1);
++	check_decode("%Z", "", -1);
++	check_decode("%FG", "", -1);
++}
++
++void
++tests(void)
++{
++	test_percent_encode();
++	test_percent_encode_multibyte();
++	test_percent_decode();
++	test_parse_valid();
++	test_parse_invalid();
++	test_generate_valid();
++}
+diff --git a/servconf.c b/servconf.c
+index 932d363b..2c6c5e0e 100644
+--- a/servconf.c
++++ b/servconf.c
+@@ -156,6 +156,7 @@ initialize_server_options(ServerOptions *options)
+ 	options->max_authtries = -1;
+ 	options->max_sessions = -1;
+ 	options->banner = NULL;
++	options->show_patchlevel = -1;
+ 	options->use_dns = -1;
+ 	options->client_alive_interval = -1;
+ 	options->client_alive_count_max = -1;
+@@ -401,6 +402,8 @@ fill_default_server_options(ServerOptions *options)
+ 		options->ip_qos_bulk = IPTOS_DSCP_CS1;
+ 	if (options->version_addendum == NULL)
+ 		options->version_addendum = xstrdup("");
++	if (options->show_patchlevel == -1)
++		options->show_patchlevel = 0;
+ 	if (options->fwd_opts.streamlocal_bind_mask == (mode_t)-1)
+ 		options->fwd_opts.streamlocal_bind_mask = 0177;
+ 	if (options->fwd_opts.streamlocal_bind_unlink == -1)
+@@ -480,7 +483,7 @@ typedef enum {
+ 	sIgnoreUserKnownHosts, sCiphers, sMacs, sPidFile,
+ 	sGatewayPorts, sPubkeyAuthentication, sPubkeyAcceptedKeyTypes,
+ 	sXAuthLocation, sSubsystem, sMaxStartups, sMaxAuthTries, sMaxSessions,
+-	sBanner, sUseDNS, sHostbasedAuthentication,
++	sBanner, sShowPatchLevel, sUseDNS, sHostbasedAuthentication,
+ 	sHostbasedUsesNameFromPacketOnly, sHostbasedAcceptedKeyTypes,
+ 	sHostKeyAlgorithms,
+ 	sClientAliveInterval, sClientAliveCountMax, sAuthorizedKeysFile,
+@@ -607,6 +610,7 @@ static struct {
+ 	{ "maxauthtries", sMaxAuthTries, SSHCFG_ALL },
+ 	{ "maxsessions", sMaxSessions, SSHCFG_ALL },
+ 	{ "banner", sBanner, SSHCFG_ALL },
++	{ "showpatchlevel", sShowPatchLevel, SSHCFG_GLOBAL },
+ 	{ "usedns", sUseDNS, SSHCFG_GLOBAL },
+ 	{ "verifyreversemapping", sDeprecated, SSHCFG_GLOBAL },
+ 	{ "reversemappingcheck", sDeprecated, SSHCFG_GLOBAL },
+@@ -1646,6 +1650,10 @@ process_server_config_line(ServerOptions *options, char *line,
+ 		intptr = &options->disable_forwarding;
+ 		goto parse_flag;
+ 
++	case sShowPatchLevel:
++		intptr = &options->show_patchlevel;
++		goto parse_flag;
++
+ 	case sAllowUsers:
+ 		while ((arg = strdelim(&cp)) && *arg != '\0') {
+ 			if (match_user(NULL, NULL, NULL, arg) == -1)
+@@ -2580,6 +2588,7 @@ dump_config(ServerOptions *o)
+ 	dump_cfg_fmtint(sEmptyPasswd, o->permit_empty_passwd);
+ 	dump_cfg_fmtint(sCompression, o->compression);
+ 	dump_cfg_fmtint(sGatewayPorts, o->fwd_opts.gateway_ports);
++	dump_cfg_fmtint(sShowPatchLevel, o->show_patchlevel);
+ 	dump_cfg_fmtint(sUseDNS, o->use_dns);
+ 	dump_cfg_fmtint(sAllowTcpForwarding, o->allow_tcp_forwarding);
+ 	dump_cfg_fmtint(sAllowAgentForwarding, o->allow_agent_forwarding);
+diff --git a/servconf.h b/servconf.h
+index 0175e00e..5afba90e 100644
+--- a/servconf.h
++++ b/servconf.h
+@@ -165,6 +165,7 @@ typedef struct {
+ 	int	max_authtries;
+ 	int	max_sessions;
+ 	char   *banner;			/* SSH-2 banner message */
++	int	show_patchlevel;	/* Show vendor patch level to clients */
+ 	int	use_dns;
+ 	int	client_alive_interval;	/*
+ 					 * poke the client this often to
+diff --git a/ssh-add.c b/ssh-add.c
+index 627c0298..8bdcefd1 100644
+--- a/ssh-add.c
++++ b/ssh-add.c
+@@ -64,6 +64,7 @@
+ #include "misc.h"
+ #include "ssherr.h"
+ #include "digest.h"
++#include "ssh-pkcs11-uri.h"
+ 
+ /* argv0 */
+ extern char *__progname;
+@@ -188,6 +189,24 @@ delete_all(int agent_fd, int qflag)
+ 	return ret;
+ }
+ 
++#ifdef ENABLE_PKCS11
++static int update_card(int, int, const char *, int);
++
++int
++update_pkcs11_uri(int agent_fd, int adding, const char *pkcs11_uri, int qflag)
++{
++	struct pkcs11_uri *uri;
++
++	/* dry-run parse to make sure the URI is valid and to report errors */
++	uri = pkcs11_uri_init();
++	if (pkcs11_uri_parse((char *) pkcs11_uri, uri) != 0)
++		fatal("Failed to parse PKCS#11 URI");
++	pkcs11_uri_cleanup(uri);
++
++	return update_card(agent_fd, adding, pkcs11_uri, qflag);
++}
++#endif
++
+ static int
+ add_file(int agent_fd, const char *filename, int key_only, int qflag)
+ {
+@@ -495,6 +514,13 @@ lock_agent(int agent_fd, int lock)
+ static int
+ do_file(int agent_fd, int deleting, int key_only, char *file, int qflag)
+ {
++#ifdef ENABLE_PKCS11
++	if (strlen(file) >= strlen(PKCS11_URI_SCHEME) &&
++	    strncmp(file, PKCS11_URI_SCHEME,
++	    strlen(PKCS11_URI_SCHEME)) == 0) {
++		return update_pkcs11_uri(agent_fd, !deleting, file, qflag);
++	}
++#endif
+ 	if (deleting) {
+ 		if (delete_file(agent_fd, file, key_only, qflag) == -1)
+ 			return -1;
+diff --git a/ssh-agent.c b/ssh-agent.c
+index d8a8260f..ff7a620e 100644
+--- a/ssh-agent.c
++++ b/ssh-agent.c
+@@ -546,10 +546,72 @@ no_identities(SocketEntry *e)
+ }
+ 
+ #ifdef ENABLE_PKCS11
++static char *
++sanitize_pkcs11_provider(const char *provider)
++{
++	struct pkcs11_uri *uri = NULL;
++	char *sane_uri, *module_path = NULL; /* default path */
++	char canonical_provider[PATH_MAX];
++
++	if (provider == NULL)
++		return NULL;
++
++	if (strlen(provider) >= strlen(PKCS11_URI_SCHEME) &&
++	    strncmp(provider, PKCS11_URI_SCHEME,
++	    strlen(PKCS11_URI_SCHEME)) == 0) {
++		/* PKCS#11 URI */
++		uri = pkcs11_uri_init();
++		if (uri == NULL) {
++			error("Failed to init PCKS#11 URI");
++			return NULL;
++		}
++
++		if (pkcs11_uri_parse(provider, uri) != 0) {
++			error("Failed to parse PKCS#11 URI");
++			return NULL;
++		}
++		/* validate also provider from URI */
++		if (uri->module_path)
++			module_path = strdup(uri->module_path);
++	} else
++		module_path = strdup(provider); /* simple path */
++
++	if (module_path != NULL) { /* do not validate default NULL path in URI */
++		if (realpath(module_path, canonical_provider) == NULL) {
++			verbose("failed PKCS#11 provider \"%.100s\": realpath: %s",
++			    module_path, strerror(errno));
++			free(module_path);
++			pkcs11_uri_cleanup(uri);
++			return NULL;
++		}
++		free(module_path);
++		if (match_pattern_list(canonical_provider, pkcs11_whitelist, 0) != 1) {
++			verbose("refusing PKCS#11 provider \"%.100s\": "
++			    "not whitelisted", canonical_provider);
++			pkcs11_uri_cleanup(uri);
++			return NULL;
++		}
++
++		/* copy verified and sanitized provider path back to the uri */
++		if (uri) {
++			free(uri->module_path);
++			uri->module_path = xstrdup(canonical_provider);
++		}
++	}
++
++	if (uri) {
++		sane_uri = pkcs11_uri_get(uri);
++		pkcs11_uri_cleanup(uri);
++		return sane_uri;
++	} else {
++		return xstrdup(canonical_provider); /* simple path */
++	}
++}
++
+ static void
+ process_add_smartcard_key(SocketEntry *e)
+ {
+-	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
++	char *provider = NULL, *pin = NULL, *sane_uri = NULL;
+ 	int r, i, count = 0, success = 0, confirm = 0;
+ 	u_int seconds;
+ 	time_t death = 0;
+@@ -585,28 +647,23 @@ process_add_smartcard_key(SocketEntry *e)
+ 			goto send;
+ 		}
+ 	}
+-	if (realpath(provider, canonical_provider) == NULL) {
+-		verbose("failed PKCS#11 add of \"%.100s\": realpath: %s",
+-		    provider, strerror(errno));
+-		goto send;
+-	}
+-	if (match_pattern_list(canonical_provider, pkcs11_whitelist, 0) != 1) {
+-		verbose("refusing PKCS#11 add of \"%.100s\": "
+-		    "provider not whitelisted", canonical_provider);
++
++	sane_uri = sanitize_pkcs11_provider(provider);
++	if (sane_uri == NULL)
+ 		goto send;
+-	}
+-	debug("%s: add %.100s", __func__, canonical_provider);
++
+ 	if (lifetime && !death)
+ 		death = monotime() + lifetime;
+ 
+-	count = pkcs11_add_provider(canonical_provider, pin, &keys);
++	debug("%s: add %.100s", __func__, sane_uri);
++	count = pkcs11_add_provider(sane_uri, pin, &keys);
+ 	for (i = 0; i < count; i++) {
+ 		k = keys[i];
+ 		if (lookup_identity(k) == NULL) {
+ 			id = xcalloc(1, sizeof(Identity));
+ 			id->key = k;
+-			id->provider = xstrdup(canonical_provider);
+-			id->comment = xstrdup(canonical_provider); /* XXX */
++			id->provider = xstrdup(sane_uri);
++			id->comment = xstrdup(sane_uri);
+ 			id->death = death;
+ 			id->confirm = confirm;
+ 			TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
+@@ -620,6 +677,7 @@ process_add_smartcard_key(SocketEntry *e)
+ send:
+ 	free(pin);
+ 	free(provider);
++	free(sane_uri);
+ 	free(keys);
+ 	send_status(e, success);
+ }
+@@ -627,7 +685,7 @@ send:
+ static void
+ process_remove_smartcard_key(SocketEntry *e)
+ {
+-	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
++	char *provider = NULL, *pin = NULL, *sane_uri = NULL;
+ 	int r, success = 0;
+ 	Identity *id, *nxt;
+ 
+@@ -638,30 +696,29 @@ process_remove_smartcard_key(SocketEntry *e)
+ 	}
+ 	free(pin);
+ 
+-	if (realpath(provider, canonical_provider) == NULL) {
+-		verbose("failed PKCS#11 add of \"%.100s\": realpath: %s",
+-		    provider, strerror(errno));
++	sane_uri = sanitize_pkcs11_provider(provider);
++	if (sane_uri == NULL)
+ 		goto send;
+-	}
+ 
+-	debug("%s: remove %.100s", __func__, canonical_provider);
++	debug("%s: remove %.100s", __func__, sane_uri);
+ 	for (id = TAILQ_FIRST(&idtab->idlist); id; id = nxt) {
+ 		nxt = TAILQ_NEXT(id, next);
+ 		/* Skip file--based keys */
+ 		if (id->provider == NULL)
+ 			continue;
+-		if (!strcmp(canonical_provider, id->provider)) {
++		if (!strcmp(sane_uri, id->provider)) {
+ 			TAILQ_REMOVE(&idtab->idlist, id, next);
+ 			free_identity(id);
+ 			idtab->nentries--;
+ 		}
+ 	}
+-	if (pkcs11_del_provider(canonical_provider) == 0)
++	if (pkcs11_del_provider(sane_uri) == 0)
+ 		success = 1;
+ 	else
+ 		error("%s: pkcs11_del_provider failed", __func__);
+ send:
+ 	free(provider);
++	free(sane_uri);
+ 	send_status(e, success);
+ }
+ #endif /* ENABLE_PKCS11 */
+diff --git a/ssh-keygen.c b/ssh-keygen.c
+index 46b3af5a..94126be0 100644
+--- a/ssh-keygen.c
++++ b/ssh-keygen.c
+@@ -825,6 +825,7 @@ do_download(struct passwd *pw)
+ 			free(fp);
+ 		} else {
+ 			(void) sshkey_write(keys[i], stdout); /* XXX check */
++			(void) pkcs11_uri_write(keys[i], stdout);
+ 			fprintf(stdout, "\n");
+ 		}
+ 		sshkey_free(keys[i]);
+diff --git a/ssh-pkcs11-client.c b/ssh-pkcs11-client.c
+index d1241ce6..c1cc3181 100644
+--- a/ssh-pkcs11-client.c
++++ b/ssh-pkcs11-client.c
+@@ -31,6 +31,15 @@
+ #include <errno.h>
+ 
+ #include <openssl/rsa.h>
++#ifdef OPENSSL_HAS_ECC
++#include <openssl/ecdsa.h>
++#if ((defined(LIBRESSL_VERSION_NUMBER) && \
++	(LIBRESSL_VERSION_NUMBER >= 0x20010002L))) || \
++	(defined(ECDSA_F_ECDSA_METHOD_NEW)) || \
++	(OPENSSL_VERSION_NUMBER >= 0x00010100L)
++#define ENABLE_PKCS11_ECDSA 1
++#endif
++#endif
+ 
+ #include "openbsd-compat/openssl-compat.h"
+ 
+@@ -126,6 +135,7 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
+ 		return (-1);
+ 	key.type = KEY_RSA;
+ 	key.rsa = rsa;
++	key.ecdsa_nid = 0;
+ 	if ((r = sshkey_to_blob(&key, &blob, &blen)) != 0) {
+ 		error("%s: sshkey_to_blob: %s", __func__, ssh_err(r));
+ 		return -1;
+@@ -154,9 +164,9 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
+ 	return (ret);
+ }
+ 
+-/* redirect the private key encrypt operation to the ssh-pkcs11-helper */
++/* redirect the RSA private key encrypt operation to the ssh-pkcs11-helper */
+ static int
+-wrap_key(RSA *rsa)
++wrap_rsa_key(RSA *rsa)
+ {
+ 	static RSA_METHOD *helper_rsa;
+ 
+@@ -169,6 +179,88 @@ wrap_key(RSA *rsa)
+ 	return (0);
+ }
+ 
++#ifdef ENABLE_PKCS11_ECDSA
++static ECDSA_SIG *
++pkcs11_ecdsa_private_sign(const unsigned char *from, int flen,
++    const BIGNUM *inv, const BIGNUM *rp, EC_KEY * ecdsa)
++{
++	struct sshkey *key = NULL;
++	u_char *blob, *signature = NULL;
++	size_t blen, slen = 0;
++	struct sshbuf *msg = NULL;
++	ECDSA_SIG *ret = NULL;
++	BIGNUM *r = NULL, *s = NULL;
++	int rv;
++
++	if ((key = sshkey_new(KEY_ECDSA)) == NULL)
++		fatal("%s: sshkey_new failed", __func__);
++	key->ecdsa = ecdsa;
++	key->ecdsa_nid = sshkey_ecdsa_key_to_nid(ecdsa);
++	if (sshkey_to_blob(key, &blob, &blen) == 0)
++		goto out;
++	if ((msg = sshbuf_new()) == NULL)
++		fatal("%s: sshbuf_new failed", __func__);
++	if ((rv = sshbuf_put_u8(msg, SSH2_AGENTC_SIGN_REQUEST)) != 0 ||
++	    (rv = sshbuf_put_string(msg, blob, blen)) != 0 ||
++	    (rv = sshbuf_put_string(msg, from, flen)) != 0 ||
++	    (rv = sshbuf_put_u32(msg, 0)) != 0)
++		fatal("%s: buffer error: %s", __func__, ssh_err(rv));
++	free(blob);
++	send_msg(msg);
++	sshbuf_reset(msg);
++
++	if (recv_msg(msg) == SSH2_AGENT_SIGN_RESPONSE) {
++		if ((rv = sshbuf_get_string(msg, &signature, &slen)) != 0)
++			fatal("%s: buffer error: %s", __func__, ssh_err(rv));
++		if (slen <= (size_t)ECDSA_size(ecdsa)) {
++			int nlen = slen / 2;
++			ret = ECDSA_SIG_new();
++			r = BN_new();
++			s = BN_new();
++			BN_bin2bn(&signature[0], nlen, r);
++			BN_bin2bn(&signature[nlen], nlen, s);
++			ECDSA_SIG_set0(ret, r, s);
++		}
++		free(signature);
++	}
++out:
++	sshkey_free(key);
++	sshbuf_free(msg);
++	return (ret);
++}
++
++/* redirect the ECDSA private key encrypt operation to the ssh-pkcs11-helper */
++static int
++wrap_ecdsa_key(EC_KEY *ecdsa) {
++#if (OPENSSL_VERSION_NUMBER >= 0x00010100L)
++	static EC_KEY_METHOD *helper_ecdsa = NULL;
++	if (helper_ecdsa == NULL) {
++		const EC_KEY_METHOD *def = EC_KEY_get_default_method();
++		helper_ecdsa = EC_KEY_METHOD_new(def);
++		EC_KEY_METHOD_set_sign(helper_ecdsa, NULL, NULL, pkcs11_ecdsa_private_sign);
++	}
++	EC_KEY_set_method(ecdsa, helper_ecdsa);
++#else
++	static ECDSA_METHOD *helper_ecdsa = NULL;
++	if(helper_ecdsa == NULL) {
++		const ECDSA_METHOD *def = ECDSA_get_default_method();
++# ifdef ECDSA_F_ECDSA_METHOD_NEW
++		helper_ecdsa = ECDSA_METHOD_new((ECDSA_METHOD *)def);
++		ECDSA_METHOD_set_name(helper_ecdsa, "ssh-pkcs11-helper-ecdsa");
++		ECDSA_METHOD_set_sign(helper_ecdsa, pkcs11_ecdsa_private_sign);
++# else
++		helper_ecdsa = xcalloc(1, sizeof(*helper_ecdsa));
++		memcpy(helper_ecdsa, def, sizeof(*helper_ecdsa));
++		helper_ecdsa->name = "ssh-pkcs11-helper-ecdsa";
++		helper_ecdsa->ecdsa_do_sign = pkcs11_ecdsa_private_sign;
++# endif
++	}
++	ECDSA_set_method(ecdsa, helper_ecdsa);
++#endif
++	return (0);
++}
++#endif
++
+ static int
+ pkcs11_start_helper(void)
+ {
+@@ -210,6 +302,8 @@ pkcs11_add_provider(char *name, char *pin, struct sshkey ***keysp)
+ 	u_int nkeys, i;
+ 	struct sshbuf *msg;
+ 
++	debug("%s: called, name = %s", __func__, name);
++
+ 	if (fd < 0 && pkcs11_start_helper() < 0)
+ 		return (-1);
+ 
+@@ -226,6 +320,7 @@ pkcs11_add_provider(char *name, char *pin, struct sshkey ***keysp)
+ 		if ((r = sshbuf_get_u32(msg, &nkeys)) != 0)
+ 			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+ 		*keysp = xcalloc(nkeys, sizeof(struct sshkey *));
++		debug("%s: nkeys = %u", __func__, nkeys);
+ 		for (i = 0; i < nkeys; i++) {
+ 			/* XXX clean up properly instead of fatal() */
+ 			if ((r = sshbuf_get_string(msg, &blob, &blen)) != 0 ||
+@@ -234,7 +329,15 @@ pkcs11_add_provider(char *name, char *pin, struct sshkey ***keysp)
+ 				    __func__, ssh_err(r));
+ 			if ((r = sshkey_from_blob(blob, blen, &k)) != 0)
+ 				fatal("%s: bad key: %s", __func__, ssh_err(r));
+-			wrap_key(k->rsa);
++			if(k->type == KEY_RSA) {
++				wrap_rsa_key(k->rsa);
++#ifdef ENABLE_PKCS11_ECDSA
++			} else if(k->type == KEY_ECDSA) {
++				wrap_ecdsa_key(k->ecdsa);
++#endif /* ENABLE_PKCS11_ECDSA */
++			} else {
++				/* Unsupported type */
++			}
+ 			(*keysp)[i] = k;
+ 			free(blob);
+ 		}
+diff --git a/ssh-pkcs11-helper.c b/ssh-pkcs11-helper.c
+index 6301033c..d5940667 100644
+--- a/ssh-pkcs11-helper.c
++++ b/ssh-pkcs11-helper.c
+@@ -24,6 +24,17 @@
+ 
+ #include "openbsd-compat/sys-queue.h"
+ 
++#include <openssl/rsa.h>
++#ifdef OPENSSL_HAS_ECC
++#include <openssl/ecdsa.h>
++#if ((defined(LIBRESSL_VERSION_NUMBER) && \
++	(LIBRESSL_VERSION_NUMBER >= 0x20010002L))) || \
++	(defined(ECDSA_F_ECDSA_METHOD_NEW)) || \
++	(OPENSSL_VERSION_NUMBER >= 0x00010100L)
++#define ENABLE_PKCS11_ECDSA 1
++#endif
++#endif
++
+ #include <stdarg.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -77,7 +88,7 @@ del_keys_by_name(char *name)
+ 		if (!strcmp(ki->providername, name)) {
+ 			TAILQ_REMOVE(&pkcs11_keylist, ki, next);
+ 			free(ki->providername);
+-			sshkey_free(ki->key);
++			pkcs11_del_key(ki->key);
+ 			free(ki);
+ 		}
+ 	}
+@@ -172,6 +183,20 @@ process_del(void)
+ 	sshbuf_free(msg);
+ }
+ 
++#ifdef ENABLE_PKCS11_ECDSA
++static u_int EC_KEY_order_size(EC_KEY *key)
++{
++	const EC_GROUP *group = EC_KEY_get0_group(key);
++	BIGNUM *order = BN_new();
++	u_int nbytes = 0;
++	if ((group != NULL) && (order != NULL) && EC_GROUP_get_order(group, order, NULL)) {
++		nbytes = BN_num_bytes(order);
++	}
++	BN_clear_free(order);
++	return nbytes;
++}
++#endif /* ENABLE_PKCS11_ECDSA */
++
+ static void
+ process_sign(void)
+ {
+@@ -192,14 +217,38 @@ process_sign(void)
+ 	else {
+ 		if ((found = lookup_key(key)) != NULL) {
+ #ifdef WITH_OPENSSL
+-			int ret;
+-
+-			slen = RSA_size(key->rsa);
+-			signature = xmalloc(slen);
+-			if ((ret = RSA_private_encrypt(dlen, data, signature,
+-			    found->rsa, RSA_PKCS1_PADDING)) != -1) {
+-				slen = ret;
+-				ok = 0;
++			if(found->type == KEY_RSA) {
++				int ret;
++				slen = RSA_size(key->rsa);
++				signature = xmalloc(slen);
++				if ((ret = RSA_private_encrypt(dlen, data, signature,
++											   found->rsa, RSA_PKCS1_PADDING)) != -1) {
++					slen = ret;
++					ok = 0;
++				}
++#ifdef ENABLE_PKCS11_ECDSA
++			} else if(found->type == KEY_ECDSA) {
++				ECDSA_SIG *sig;
++				const BIGNUM *r = NULL, *s = NULL;
++				if ((sig = ECDSA_do_sign(data, dlen, found->ecdsa)) != NULL) {
++					/* PKCS11 2.3.1 recommends both r and s to have the order size for
++					   backward compatiblity */
++					ECDSA_SIG_get0(sig, &r, &s);
++					u_int o_len = EC_KEY_order_size(found->ecdsa);
++					u_int r_len = BN_num_bytes(r);
++					u_int s_len = BN_num_bytes(s);
++					if (o_len > 0 && r_len <= o_len && s_len <= o_len) {
++						signature = xcalloc(2, o_len);
++						BN_bn2bin(r, signature + o_len - r_len);
++						BN_bn2bin(s, signature + (2 * o_len) - s_len);
++						slen = 2 * o_len;
++						ok = 0;
++					}
++					ECDSA_SIG_free(sig);
++				}
++#endif /* ENABLE_PKCS11_ECDSA */
++			} else {
++				/* Unsupported type */
+ 			}
+ #endif /* WITH_OPENSSL */
+ 		}
+diff --git a/ssh-pkcs11-uri.c b/ssh-pkcs11-uri.c
+new file mode 100644
+index 00000000..f453c012
+--- /dev/null
++++ b/ssh-pkcs11-uri.c
+@@ -0,0 +1,395 @@
++/*
++ * Copyright (c) 2017 Red Hat
++ *
++ * Authors: Jakub Jelen <jjelen@redhat.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include "includes.h"
++
++#ifdef ENABLE_PKCS11
++
++#include <stdio.h>
++#include <string.h>
++
++#include "sshkey.h"
++#include "sshbuf.h"
++#include "log.h"
++
++#define CRYPTOKI_COMPAT
++#include "pkcs11.h"
++
++#include "ssh-pkcs11-uri.h"
++
++#define PKCS11_URI_PATH_SEPARATOR ";"
++#define PKCS11_URI_QUERY_SEPARATOR "&"
++#define PKCS11_URI_VALUE_SEPARATOR "="
++#define PKCS11_URI_ID "id"
++#define PKCS11_URI_TOKEN "token"
++#define PKCS11_URI_OBJECT "object"
++#define PKCS11_URI_LIB_MANUF "library-manufacturer"
++#define PKCS11_URI_MANUF "manufacturer"
++#define PKCS11_URI_MODULE_PATH "module-path"
++
++/* Keyword tokens. */
++typedef enum {
++	pId, pToken, pObject, pLibraryManufacturer, pManufacturer, pModulePath,
++	pBadOption
++} pkcs11uriOpCodes;
++
++/* Textual representation of the tokens. */
++static struct {
++	const char *name;
++	pkcs11uriOpCodes opcode;
++} keywords[] = {
++	{ PKCS11_URI_ID, pId },
++	{ PKCS11_URI_TOKEN, pToken },
++	{ PKCS11_URI_OBJECT, pObject },
++	{ PKCS11_URI_LIB_MANUF, pLibraryManufacturer },
++	{ PKCS11_URI_MANUF, pManufacturer },
++	{ PKCS11_URI_MODULE_PATH, pModulePath },
++	{ NULL, pBadOption }
++};
++
++static pkcs11uriOpCodes
++parse_token(const char *cp)
++{
++	u_int i;
++
++	for (i = 0; keywords[i].name; i++)
++		if (strncasecmp(cp, keywords[i].name,
++		    strlen(keywords[i].name)) == 0)
++			return keywords[i].opcode;
++
++	return pBadOption;
++}
++
++int
++percent_decode(char *data, char **outp)
++{
++	char tmp[3];
++	char *out, *tmp_end;
++	char *p = data;
++	long value;
++	size_t outlen = 0;
++
++	out = malloc(strlen(data)+1); /* upper bound */
++	if (out == NULL)
++		return -1;
++	while (*p != '\0') {
++		switch (*p) {
++		case '%':
++			p++;
++			if (*p == '\0')
++				goto fail;
++			tmp[0] = *p++;
++			if (*p == '\0')
++				goto fail;
++			tmp[1] = *p++;
++			tmp[2] = '\0';
++			tmp_end = NULL;
++			value = strtol(tmp, &tmp_end, 16);
++			if (tmp_end != tmp+2)
++				goto fail;
++			else
++				out[outlen++] = (char) value;
++			break;
++		default:
++			out[outlen++] = *p++;
++			break;
++		}
++	}
++
++	/* zero terminate */
++	out[outlen] = '\0';
++	*outp = out;
++	return outlen;
++fail:
++	free(out);
++	return -1;
++}
++
++struct sshbuf *
++percent_encode(const char *data, size_t length, const char *whitelist)
++{
++	struct sshbuf *b = NULL;
++	char tmp[4], *cp;
++	size_t i;
++
++	if ((b = sshbuf_new()) == NULL)
++		return NULL;
++	for (i = 0; i < length; i++) {
++		cp = strchr(whitelist, data[i]);
++		/* if c is specified as '\0' pointer to terminator is returned !! */
++		if (cp != NULL && *cp != '\0') {
++			if (sshbuf_put(b, &data[i], 1) != 0)
++				goto err;
++		} else
++			if (snprintf(tmp, 4, "%%%02X", (unsigned char) data[i]) < 3
++			    || sshbuf_put(b, tmp, 3) != 0)
++				goto err;
++	}
++	if (sshbuf_put(b, "\0", 1) == 0)
++		return b;
++err:
++	sshbuf_free(b);
++	return NULL;
++}
++
++char *
++pkcs11_uri_append(char *part, const char *separator, const char *key,
++    struct sshbuf *value)
++{
++	char *new_part;
++	size_t size = 0;
++
++	if (value == NULL)
++		return NULL;
++
++	size = asprintf(&new_part,
++	    "%s%s%s"  PKCS11_URI_VALUE_SEPARATOR "%s",
++	    (part != NULL ? part : ""),
++	    (part != NULL ? separator : ""),
++	    key, sshbuf_ptr(value));
++	sshbuf_free(value);
++	free(part);
++
++	if (size <= 0)
++		return NULL;
++	return new_part;
++}
++
++char *
++pkcs11_uri_get(struct pkcs11_uri *uri)
++{
++	size_t size = 0;
++	char *p = NULL, *path = NULL, *query = NULL;
++
++	/* compose a percent-encoded ID */
++	if (uri->id_len > 0) {
++		struct sshbuf *key_id = percent_encode(uri->id, uri->id_len, "");
++		path = pkcs11_uri_append(path, PKCS11_URI_PATH_SEPARATOR,
++		    PKCS11_URI_ID, key_id);
++		if (path == NULL)
++			goto err;
++	}
++
++	/* Write object label */
++	if (uri->object) {
++		struct sshbuf *label = percent_encode(uri->object, strlen(uri->object),
++		    PKCS11_URI_WHITELIST);
++		path = pkcs11_uri_append(path, PKCS11_URI_PATH_SEPARATOR,
++		    PKCS11_URI_OBJECT, label);
++		if (path == NULL)
++			goto err;
++	}
++
++	/* Write token label */
++	if (uri->token) {
++		struct sshbuf *label = percent_encode(uri->token, strlen(uri->token),
++		    PKCS11_URI_WHITELIST);
++		path = pkcs11_uri_append(path, PKCS11_URI_PATH_SEPARATOR,
++		    PKCS11_URI_TOKEN, label);
++		if (path == NULL)
++			goto err;
++	}
++
++	/* Write manufacturer */
++	if (uri->manuf) {
++		struct sshbuf *manuf = percent_encode(uri->manuf,
++		    strlen(uri->manuf), PKCS11_URI_WHITELIST);
++		path = pkcs11_uri_append(path, PKCS11_URI_PATH_SEPARATOR,
++		    PKCS11_URI_MANUF, manuf);
++		if (path == NULL)
++			goto err;
++	}
++
++	/* Write module_path */
++	if (uri->module_path) {
++		struct sshbuf *module = percent_encode(uri->module_path,
++		    strlen(uri->module_path), PKCS11_URI_WHITELIST "/");
++		query = pkcs11_uri_append(query, PKCS11_URI_QUERY_SEPARATOR,
++		    PKCS11_URI_MODULE_PATH, module);
++		if (query == NULL)
++			goto err;
++	}
++
++	size = asprintf(&p, PKCS11_URI_SCHEME "%s%s%s",
++	    path != NULL ? path : "",
++	    query != NULL ? "?" : "",
++	    query != NULL ? query : "");
++err:
++	free(query);
++	free(path);
++	if (size <= 0)
++		return NULL;
++	return p;
++}
++
++struct pkcs11_uri *
++pkcs11_uri_init()
++{
++	struct pkcs11_uri *d = calloc(1, sizeof(struct pkcs11_uri));
++	return d;
++}
++
++void
++pkcs11_uri_cleanup(struct pkcs11_uri *pkcs11)
++{
++	free(pkcs11->id);
++	free(pkcs11->module_path);
++	free(pkcs11->token);
++	free(pkcs11->object);
++	free(pkcs11->lib_manuf);
++	free(pkcs11->manuf);
++	free(pkcs11);
++}
++
++int
++pkcs11_uri_parse(const char *uri, struct pkcs11_uri *pkcs11)
++{
++	char *saveptr1, *saveptr2, *str1, *str2, *tok;
++	int rv = 0, len;
++	char *p = NULL;
++
++	size_t scheme_len = strlen(PKCS11_URI_SCHEME);
++	if (strlen(uri) < scheme_len || /* empty URI matches everything */
++	    strncmp(uri, PKCS11_URI_SCHEME, scheme_len) != 0) {
++		error("%s: The '%s' does not look like PKCS#11 URI",
++		    __func__, uri);
++		return -1;
++	}
++
++	if (pkcs11 == NULL) {
++		error("%s: Bad arguments. The pkcs11 can't be null", __func__);
++		return -1;
++	}
++
++	/* skip URI schema name */
++	p = strdup(uri);
++	str1 = p;
++
++	/* everything before ? */
++	tok = strtok_r(str1, "?", &saveptr1);
++	if (tok == NULL) {
++		free(p);
++		error("%s: pk11-path expected, got EOF", __func__);
++		return -1;
++	}
++
++	/* skip URI schema name:
++	 * the scheme ensures that there is at least something before "?"
++	 * allowing empty pk11-path. Resulting token at worst pointing to
++	 * \0 byte */
++	tok = tok + scheme_len;
++
++	/* parse pk11-path */
++	for (str2 = tok; ; str2 = NULL) {
++		char **charptr;
++		pkcs11uriOpCodes opcode;
++		tok = strtok_r(str2, PKCS11_URI_PATH_SEPARATOR, &saveptr2);
++		if (tok == NULL)
++			break;
++		opcode = parse_token(tok);
++
++		char *arg = tok + strlen(keywords[opcode].name) + 1; /* separator "=" */
++		switch (opcode) {
++		case pId:
++			/* CKA_ID */
++			if (pkcs11->id != NULL) {
++				verbose("%s: The id already set in the PKCS#11 URI",
++					__func__);
++				rv = -1;
++			}
++			len = percent_decode(arg, &pkcs11->id);
++			if (len <= 0) {
++				verbose("%s: Failed to percent-decode CKA_ID: %s",
++				    __func__, arg);
++				rv = -1;
++			} else
++				pkcs11->id_len = len;
++			debug3("%s: Setting CKA_ID = %s from PKCS#11 URI",
++			    __func__, arg);
++			break;
++		case pToken:
++			/* CK_TOKEN_INFO -> label */
++			charptr = &pkcs11->token;
++ parse_string:
++			if (*charptr != NULL) {
++				verbose("%s: The %s already set in the PKCS#11 URI",
++				    keywords[opcode].name, __func__);
++				rv = -1;
++			}
++			percent_decode(arg, charptr);
++			debug3("%s: Setting %s = %s from PKCS#11 URI",
++			    __func__, keywords[opcode].name, *charptr);
++			break;
++
++		case pObject:
++			/* CK_TOKEN_INFO -> manufacturerID */
++			charptr = &pkcs11->object;
++			goto parse_string;
++
++		case pManufacturer:
++			/* CK_TOKEN_INFO -> manufacturerID */
++			charptr = &pkcs11->manuf;
++			goto parse_string;
++
++		case pLibraryManufacturer:
++			/* CK_INFO -> manufacturerID */
++			charptr = &pkcs11->lib_manuf;
++			goto parse_string;
++
++		case pBadOption:
++		default:
++			/* Unrecognized attribute in the URI path SHOULD be error */
++			verbose("%s: Unknown part of path in PKCS#11 URI: %s",
++			    __func__, tok);
++		}
++	}
++
++	tok = strtok_r(NULL, "?", &saveptr1);
++	if (tok == NULL) {
++		free(p);
++		return rv;
++	}
++	/* parse pk11-query (optional) */
++	for (str2 = tok; ; str2 = NULL) {
++		size_t key_len = strlen(PKCS11_URI_MODULE_PATH) + 1;
++		tok = strtok_r(str2, PKCS11_URI_QUERY_SEPARATOR, &saveptr2);
++		if (tok == NULL)
++			break;
++		if (strncasecmp(tok, PKCS11_URI_MODULE_PATH
++		    PKCS11_URI_VALUE_SEPARATOR, key_len) == 0) {
++			/* module-path is PKCS11Provider */
++			if (pkcs11->module_path != NULL) {
++				verbose("%s: Multiple module-path attributes are"
++				    "not supported the PKCS#11 URI", __func__);
++				rv = -1;
++			}
++			percent_decode(tok + key_len, &pkcs11->module_path);
++			debug3("%s: Setting PKCS11Provider = %s from PKCS#11 URI",
++			    __func__, pkcs11->module_path);
++		/* } else if ( pin-value ) { */
++		} else {
++			/* Unrecognized attribute in the URI query SHOULD be ignored */
++			verbose("%s: Unknown part of query in PKCS#11 URI: %s",
++			    __func__, tok);
++		}
++	}
++	free(p);
++	return rv;
++}
++
++#endif /* ENABLE_PKCS11 */
+diff --git a/ssh-pkcs11-uri.h b/ssh-pkcs11-uri.h
+new file mode 100644
+index 00000000..609c4df1
+--- /dev/null
++++ b/ssh-pkcs11-uri.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (c) 2017 Red Hat
++ *
++ * Authors: Jakub Jelen <jjelen@redhat.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#define PKCS11_URI_SCHEME "pkcs11:"
++#define PKCS11_URI_WHITELIST	"abcdefghijklmnopqrstuvwxyz" \
++				"ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
++				"0123456789_-.()"
++
++struct pkcs11_uri {
++	/* path */
++	char *id;
++	size_t id_len;
++	char *token;
++	char *object;
++	char *lib_manuf;
++	char *manuf;
++	/* query */
++	char *module_path;
++};
++
++struct pkcs11_uri *pkcs11_uri_init();
++void pkcs11_uri_cleanup(struct pkcs11_uri *);
++int	pkcs11_uri_parse(const char *, struct pkcs11_uri *);
++struct pkcs11_uri *pkcs11_uri_init();
++char * pkcs11_uri_get(struct pkcs11_uri *uri);
++
+diff --git a/ssh-pkcs11.c b/ssh-pkcs11.c
+index 775de964..1307f34e 100644
+--- a/ssh-pkcs11.c
++++ b/ssh-pkcs11.c
+@@ -33,6 +33,16 @@
+ #include "openbsd-compat/openssl-compat.h"
+ 
+ #include <openssl/x509.h>
++#include <openssl/rsa.h>
++#ifdef OPENSSL_HAS_ECC
++#include <openssl/ecdsa.h>
++#if ((defined(LIBRESSL_VERSION_NUMBER) && \
++	(LIBRESSL_VERSION_NUMBER >= 0x20010002L))) || \
++	(defined(ECDSA_F_ECDSA_METHOD_NEW)) || \
++	(OPENSSL_VERSION_NUMBER >= 0x00010100L)
++#define ENABLE_PKCS11_ECDSA 1
++#endif
++#endif
+ 
+ #define CRYPTOKI_COMPAT
+ #include "pkcs11.h"
+@@ -49,8 +59,8 @@ struct pkcs11_slotinfo {
+ 	int			logged_in;
+ };
+ 
+-struct pkcs11_provider {
+-	char			*name;
++struct pkcs11_module {
++	char			*module_path;
+ 	void			*handle;
+ 	CK_FUNCTION_LIST	*function_list;
+ 	CK_INFO			info;
+@@ -59,6 +69,13 @@ struct pkcs11_provider {
+ 	struct pkcs11_slotinfo	*slotinfo;
+ 	int			valid;
+ 	int			refcount;
++};
++
++struct pkcs11_provider {
++	char			*name;
++	struct pkcs11_module	*module; /* can be shared between various providers */
++	int			refcount;
++	int			valid;
+ 	TAILQ_ENTRY(pkcs11_provider) next;
+ };
+ 
+@@ -67,13 +84,53 @@ TAILQ_HEAD(, pkcs11_provider) pkcs11_providers;
+ struct pkcs11_key {
+ 	struct pkcs11_provider	*provider;
+ 	CK_ULONG		slotidx;
++	CK_ULONG		key_type;
+ 	int			(*orig_finish)(RSA *rsa);
+ 	RSA_METHOD		*rsa_method;
+ 	char			*keyid;
+ 	int			keyid_len;
++	char			*label;
+ };
+ 
+ int pkcs11_interactive = 0;
++#ifdef ENABLE_PKCS11_ECDSA
++static int pkcs11_key_idx = -1;
++#endif /* ENABLE_PKCS11_ECDSA */
++
++/*
++ * This can't be in the ssh-pkcs11-uri, becase we can not depend on
++ * PKCS#11 structures in ssh-agent (using client-helper communication)
++ */
++int
++pkcs11_uri_write(const struct sshkey *key, FILE *f)
++{
++	char *p = NULL;
++	struct pkcs11_uri uri;
++	struct pkcs11_key *k11;
++
++	/* sanity - is it a RSA key with associated app_data? */
++	if (key->type != KEY_RSA ||
++	    (k11 = RSA_get_app_data(key->rsa)) == NULL)
++		return -1;
++
++	/* omit type -- we are looking for private-public or private-certificate pairs */
++	uri.id = k11->keyid;
++	uri.id_len = k11->keyid_len;
++	uri.token = k11->provider->module->slotinfo[k11->slotidx].token.label;
++	uri.object = k11->label;
++	uri.module_path = k11->provider->module->module_path;
++	uri.lib_manuf = k11->provider->module->info.manufacturerID;
++	uri.manuf = k11->provider->module->slotinfo[k11->slotidx].token.manufacturerID;
++
++	p = pkcs11_uri_get(&uri);
++	/* do not cleanup -- we do not allocate here, only reference */
++	if (p == NULL)
++		return -1;
++
++	fprintf(f, " %s", p);
++	free(p);
++	return 0;
++}
+ 
+ int
+ pkcs11_init(int interactive)
+@@ -90,26 +147,63 @@ pkcs11_init(int interactive)
+  * this is called when a provider gets unregistered.
+  */
+ static void
+-pkcs11_provider_finalize(struct pkcs11_provider *p)
++pkcs11_module_finalize(struct pkcs11_module *m)
+ {
+ 	CK_RV rv;
+ 	CK_ULONG i;
+ 
+-	debug("pkcs11_provider_finalize: %p refcount %d valid %d",
+-	    p, p->refcount, p->valid);
+-	if (!p->valid)
++	debug("%s: %p refcount %d valid %d", __func__,
++	    m, m->refcount, m->valid);
++	if (!m->valid)
+ 		return;
+-	for (i = 0; i < p->nslots; i++) {
+-		if (p->slotinfo[i].session &&
+-		    (rv = p->function_list->C_CloseSession(
+-		    p->slotinfo[i].session)) != CKR_OK)
++	for (i = 0; i < m->nslots; i++) {
++		if (m->slotinfo[i].session &&
++		    (rv = m->function_list->C_CloseSession(
++		    m->slotinfo[i].session)) != CKR_OK)
+ 			error("C_CloseSession failed: %lu", rv);
+ 	}
+-	if ((rv = p->function_list->C_Finalize(NULL)) != CKR_OK)
++	if ((rv = m->function_list->C_Finalize(NULL)) != CKR_OK)
+ 		error("C_Finalize failed: %lu", rv);
++	m->valid = 0;
++	m->function_list = NULL;
++	dlclose(m->handle);
++}
++
++/*
++ * remove a reference to the pkcs11 module.
++ * called when a provider is unregistered.
++ */
++static void
++pkcs11_module_unref(struct pkcs11_module *m)
++{
++	debug("%s: %p refcount %d", __func__, m, m->refcount);
++	if (--m->refcount <= 0) {
++		pkcs11_module_finalize(m);
++		if (m->valid)
++			error("%s: %p still valid", __func__, m);
++		free(m->slotlist);
++		free(m->slotinfo);
++		free(m->module_path);
++		free(m);
++	}
++}
++
++/*
++ * finalize a provider shared libarary, it's no longer usable.
++ * however, there might still be keys referencing this provider,
++ * so the actuall freeing of memory is handled by pkcs11_provider_unref().
++ * this is called when a provider gets unregistered.
++ */
++static void
++pkcs11_provider_finalize(struct pkcs11_provider *p)
++{
++	debug("%s: %p refcount %d valid %d", __func__,
++	    p, p->refcount, p->valid);
++	if (!p->valid)
++		return;
++	pkcs11_module_unref(p->module);
++	p->module = NULL;
+ 	p->valid = 0;
+-	p->function_list = NULL;
+-	dlclose(p->handle);
+ }
+ 
+ /*
+@@ -119,12 +213,11 @@ pkcs11_provider_finalize(struct pkcs11_provider *p)
+ static void
+ pkcs11_provider_unref(struct pkcs11_provider *p)
+ {
+-	debug("pkcs11_provider_unref: %p refcount %d", p, p->refcount);
++	debug("%s: %p refcount %d", __func__, p, p->refcount);
+ 	if (--p->refcount <= 0) {
+-		if (p->valid)
+-			error("pkcs11_provider_unref: %p still valid", p);
+-		free(p->slotlist);
+-		free(p->slotinfo);
++		if (p->module)
++			pkcs11_module_unref(p->module);
++		free(p->name);
+ 		free(p);
+ 	}
+ }
+@@ -142,6 +235,20 @@ pkcs11_terminate(void)
+ 	}
+ }
+ 
++/* lookup provider by module path */
++static struct pkcs11_module *
++pkcs11_provider_lookup_module(char *module_path)
++{
++	struct pkcs11_provider *p;
++
++	TAILQ_FOREACH(p, &pkcs11_providers, next) {
++		debug("check %p %s (%s)", p, p->name, p->module->module_path);
++		if (!strcmp(module_path, p->module->module_path))
++			return (p->module);
++	}
++	return (NULL);
++}
++
+ /* lookup provider by name */
+ static struct pkcs11_provider *
+ pkcs11_provider_lookup(char *provider_id)
+@@ -156,19 +263,52 @@ pkcs11_provider_lookup(char *provider_id)
+ 	return (NULL);
+ }
+ 
++int pkcs11_del_provider_by_uri(struct pkcs11_uri *);
++
+ /* unregister provider by name */
+ int
+ pkcs11_del_provider(char *provider_id)
++{
++	int rv;
++	struct pkcs11_uri *uri;
++
++	debug("%s: called, provider_id = %s", __func__, provider_id);
++
++	uri = pkcs11_uri_init();
++	if (uri == NULL)
++		fatal("Failed to init PCKS#11 URI");
++
++	if (strlen(provider_id) >= strlen(PKCS11_URI_SCHEME) &&
++	    strncmp(provider_id, PKCS11_URI_SCHEME, strlen(PKCS11_URI_SCHEME)) == 0) {
++		if (pkcs11_uri_parse(provider_id, uri) != 0)
++			fatal("Failed to parse PKCS#11 URI");
++	} else {
++		uri->module_path = strdup(provider_id);
++	}
++
++	rv = pkcs11_del_provider_by_uri(uri);
++	pkcs11_uri_cleanup(uri);
++	return rv;
++}
++
++/* unregister provider by PKCS#11 URI */
++int
++pkcs11_del_provider_by_uri(struct pkcs11_uri *uri)
+ {
+ 	struct pkcs11_provider *p;
++	int rv = -1;
++	char *provider_uri = pkcs11_uri_get(uri);
++
++	debug3("%s(%s): called", __func__, provider_uri);
+ 
+-	if ((p = pkcs11_provider_lookup(provider_id)) != NULL) {
++	if ((p = pkcs11_provider_lookup(provider_uri)) != NULL) {
+ 		TAILQ_REMOVE(&pkcs11_providers, p, next);
+ 		pkcs11_provider_finalize(p);
+ 		pkcs11_provider_unref(p);
+-		return (0);
++		rv = 0;
+ 	}
+-	return (-1);
++	free(provider_uri);
++	return rv;
+ }
+ 
+ /* openssl callback for freeing an RSA key */
+@@ -185,6 +325,7 @@ pkcs11_rsa_finish(RSA *rsa)
+ 			pkcs11_provider_unref(k11->provider);
+ 		RSA_meth_free(k11->rsa_method);
+ 		free(k11->keyid);
++		free(k11->label);
+ 		free(k11);
+ 	}
+ 	return (rv);
+@@ -201,8 +342,8 @@ pkcs11_find(struct pkcs11_provider *p, CK_ULONG slotidx, CK_ATTRIBUTE *attr,
+ 	CK_RV			rv;
+ 	int			ret = -1;
+ 
+-	f = p->function_list;
+-	session = p->slotinfo[slotidx].session;
++	f = p->module->function_list;
++	session = p->module->slotinfo[slotidx].session;
+ 	if ((rv = f->C_FindObjectsInit(session, attr, nattr)) != CKR_OK) {
+ 		error("C_FindObjectsInit failed (nattr %lu): %lu", nattr, rv);
+ 		return (-1);
+@@ -218,6 +359,40 @@ pkcs11_find(struct pkcs11_provider *p, CK_ULONG slotidx, CK_ATTRIBUTE *attr,
+ 	return (ret);
+ }
+ 
++int pkcs11_login(struct pkcs11_key *k11, CK_FUNCTION_LIST *f, struct pkcs11_slotinfo *si) {
++	char			*pin = NULL, prompt[1024];
++	CK_RV			rv;
++	if ((si->token.flags & CKF_LOGIN_REQUIRED) && !si->logged_in) {
++		if (!pkcs11_interactive) {
++			error("need pin entry%s", (si->token.flags &
++			    CKF_PROTECTED_AUTHENTICATION_PATH) ?
++			    " on reader keypad" : "");
++			return (-1);
++		}
++		if (si->token.flags & CKF_PROTECTED_AUTHENTICATION_PATH)
++			verbose("Deferring PIN entry to reader keypad.");
++		else {
++			snprintf(prompt, sizeof(prompt),
++			    "Enter PIN for '%s': ", si->token.label);
++			pin = read_passphrase(prompt, RP_ALLOW_EOF);
++			if (pin == NULL)
++				return (-1);	/* bail out */
++		}
++		rv = f->C_Login(si->session, CKU_USER, (u_char *)pin,
++		    (pin != NULL) ? strlen(pin) : 0);
++		if (pin != NULL) {
++			explicit_bzero(pin, strlen(pin));
++			free(pin);
++		}
++		if (rv != CKR_OK && rv != CKR_USER_ALREADY_LOGGED_IN) {
++			error("C_Login failed: %lu", rv);
++			return (-1);
++		}
++		si->logged_in = 1;
++	}
++	return 0;
++}
++
+ /* openssl callback doing the actual signing operation */
+ static int
+ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
+@@ -239,7 +414,6 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
+ 		{CKA_ID, NULL, 0},
+ 		{CKA_SIGN, NULL, sizeof(true_val) }
+ 	};
+-	char			*pin = NULL, prompt[1024];
+ 	int			rval = -1;
+ 
+ 	key_filter[0].pValue = &private_key_class;
+@@ -249,39 +423,15 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
+ 		error("RSA_get_app_data failed for rsa %p", rsa);
+ 		return (-1);
+ 	}
+-	if (!k11->provider || !k11->provider->valid) {
++	if (!k11->provider || !k11->provider->valid || !k11->provider->module
++	    || !k11->provider->module->valid) {
+ 		error("no pkcs11 (valid) provider for rsa %p", rsa);
+ 		return (-1);
+ 	}
+-	f = k11->provider->function_list;
+-	si = &k11->provider->slotinfo[k11->slotidx];
+-	if ((si->token.flags & CKF_LOGIN_REQUIRED) && !si->logged_in) {
+-		if (!pkcs11_interactive) {
+-			error("need pin entry%s", (si->token.flags &
+-			    CKF_PROTECTED_AUTHENTICATION_PATH) ?
+-			    " on reader keypad" : "");
+-			return (-1);
+-		}
+-		if (si->token.flags & CKF_PROTECTED_AUTHENTICATION_PATH)
+-			verbose("Deferring PIN entry to reader keypad.");
+-		else {
+-			snprintf(prompt, sizeof(prompt),
+-			    "Enter PIN for '%s': ", si->token.label);
+-			pin = read_passphrase(prompt, RP_ALLOW_EOF);
+-			if (pin == NULL)
+-				return (-1);	/* bail out */
+-		}
+-		rv = f->C_Login(si->session, CKU_USER, (u_char *)pin,
+-		    (pin != NULL) ? strlen(pin) : 0);
+-		if (pin != NULL) {
+-			explicit_bzero(pin, strlen(pin));
+-			free(pin);
+-		}
+-		if (rv != CKR_OK && rv != CKR_USER_ALREADY_LOGGED_IN) {
+-			error("C_Login failed: %lu", rv);
+-			return (-1);
+-		}
+-		si->logged_in = 1;
++	f = k11->provider->module->function_list;
++	si = &k11->provider->module->slotinfo[k11->slotidx];
++	if(pkcs11_login(k11, f, si)) {
++		return (-1);
+ 	}
+ 	key_filter[1].pValue = k11->keyid;
+ 	key_filter[1].ulValueLen = k11->keyid_len;
+@@ -313,12 +463,13 @@ pkcs11_rsa_private_decrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
+ /* redirect private key operations for rsa key to pkcs11 token */
+ static int
+ pkcs11_rsa_wrap(struct pkcs11_provider *provider, CK_ULONG slotidx,
+-    CK_ATTRIBUTE *keyid_attrib, RSA *rsa)
++    CK_ATTRIBUTE *keyid_attrib, CK_ATTRIBUTE *label_attrib, RSA *rsa)
+ {
+ 	struct pkcs11_key	*k11;
+ 	const RSA_METHOD	*def = RSA_get_default_method();
+ 
+ 	k11 = xcalloc(1, sizeof(*k11));
++	k11->key_type = CKK_RSA;
+ 	k11->provider = provider;
+ 	provider->refcount++;	/* provider referenced by RSA key */
+ 	k11->slotidx = slotidx;
+@@ -328,6 +479,11 @@ pkcs11_rsa_wrap(struct pkcs11_provider *provider, CK_ULONG slotidx,
+ 		k11->keyid = xmalloc(k11->keyid_len);
+ 		memcpy(k11->keyid, keyid_attrib->pValue, k11->keyid_len);
+ 	}
++	if (label_attrib->ulValueLen > 0 ) {
++		k11->label = xmalloc(label_attrib->ulValueLen+1);
++		memcpy(k11->label, label_attrib->pValue, label_attrib->ulValueLen);
++		k11->label[label_attrib->ulValueLen] = 0;
++	}
+ 	k11->rsa_method = RSA_meth_dup(def);
+ 	if (k11->rsa_method == NULL)
+ 		fatal("%s: RSA_meth_dup failed", __func__);
+@@ -344,6 +500,184 @@ pkcs11_rsa_wrap(struct pkcs11_provider *provider, CK_ULONG slotidx,
+ 	return (0);
+ }
+ 
++#ifdef ENABLE_PKCS11_ECDSA
++static ECDSA_SIG *pkcs11_ecdsa_sign(const unsigned char *dgst, int dgst_len,
++                                    const BIGNUM *inv, const BIGNUM *rp,
++                                    EC_KEY *ecdsa) {
++	struct pkcs11_key	*k11;
++	struct pkcs11_slotinfo	*si;
++	CK_FUNCTION_LIST	*f;
++	CK_OBJECT_HANDLE	obj;
++	CK_ULONG		tlen = 0;
++	CK_RV			rv;
++	CK_OBJECT_CLASS	private_key_class = CKO_PRIVATE_KEY;
++	CK_BBOOL		true_val = CK_TRUE;
++	CK_MECHANISM		mech = {
++		CKM_ECDSA, NULL_PTR, 0
++	};
++	CK_ATTRIBUTE		key_filter[] = {
++		{CKA_CLASS, NULL, sizeof(private_key_class) },
++		{CKA_ID, NULL, 0},
++		{CKA_SIGN, NULL, sizeof(true_val) }
++	};
++	ECDSA_SIG  		*rval = NULL;
++	key_filter[0].pValue = &private_key_class;
++	key_filter[2].pValue = &true_val;
++
++ #if (OPENSSL_VERSION_NUMBER >= 0x00010100L)
++	if ((k11 = (struct pkcs11_key *)EC_KEY_get_ex_data(ecdsa, pkcs11_key_idx)) == NULL) {
++		error("EC_KEY_get_ex_data failed for ecdsa %p", ecdsa);
++ #else
++	if ((k11 = (struct pkcs11_key *)ECDSA_get_ex_data(ecdsa, pkcs11_key_idx)) == NULL) {
++		error("ECDSA_get_ex_data failed for ecdsa %p", ecdsa);
++ #endif
++		return NULL;
++	}
++	if (!k11->provider || !k11->provider->valid) {
++		error("no pkcs11 (valid) provider for ecdsa %p", ecdsa);
++		return NULL;
++	}
++	f = k11->provider->module->function_list;
++	si = &k11->provider->module->slotinfo[k11->slotidx];
++	if(pkcs11_login(k11, f, si)) {
++		return NULL;
++	}
++	key_filter[1].pValue = k11->keyid;
++	key_filter[1].ulValueLen = k11->keyid_len;
++	/* try to find object w/CKA_SIGN first, retry w/o */
++	if (pkcs11_find(k11->provider, k11->slotidx, key_filter, 3, &obj) < 0 &&
++	    pkcs11_find(k11->provider, k11->slotidx, key_filter, 2, &obj) < 0) {
++		error("cannot find private key");
++	} else if ((rv = f->C_SignInit(si->session, &mech, obj)) != CKR_OK) {
++		error("C_SignInit failed: %lu", rv);
++	} else {
++		CK_BYTE_PTR buf = NULL;
++		BIGNUM *r = NULL, *s = NULL;
++		int nlen;
++		/* Make a call to C_Sign to find out the size of the signature */
++		rv = f->C_Sign(si->session, (CK_BYTE *)dgst, dgst_len, NULL, &tlen);
++		if (rv != CKR_OK) {
++			error("C_Sign failed: %lu", rv);
++			return NULL;
++		}
++		if ((buf = xmalloc(tlen)) == NULL) {
++			error("failure to allocate signature buffer");
++			return NULL;
++		}
++		rv = f->C_Sign(si->session, (CK_BYTE *)dgst, dgst_len, buf, &tlen);
++		if (rv != CKR_OK) {
++			error("C_Sign failed: %lu", rv);
++		}
++
++		if ((rval = ECDSA_SIG_new()) == NULL ||
++		    (r = BN_new()) == NULL ||
++		    (s = BN_new()) == NULL) {
++			error("failure to allocate ECDSA signature");
++		} else {
++			/*
++			 * ECDSA signature is 2 large integers of same size returned
++			 * concatenated by PKCS#11, we separate them to create an
++			 * ECDSA_SIG for OpenSSL.
++			 */
++			nlen = tlen / 2;
++			BN_bin2bn(&buf[0], nlen, r);
++			BN_bin2bn(&buf[nlen], nlen, s);
++			ECDSA_SIG_set0(rval, r, s);
++		}
++		free(buf);
++	}
++	return (rval);
++}
++
++#if (OPENSSL_VERSION_NUMBER >= 0x00010100L)
++static EC_KEY_METHOD *get_pkcs11_ecdsa_method(void) {
++	static EC_KEY_METHOD *pkcs11_ecdsa_method = NULL;
++	if(pkcs11_key_idx == -1) {
++		pkcs11_key_idx = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, 0);
++	}
++	if (pkcs11_ecdsa_method == NULL) {
++		const EC_KEY_METHOD *def = EC_KEY_get_default_method();
++		pkcs11_ecdsa_method = EC_KEY_METHOD_new(def);
++		EC_KEY_METHOD_set_sign(pkcs11_ecdsa_method, NULL, NULL, pkcs11_ecdsa_sign);
++	}
++#else
++static ECDSA_METHOD *get_pkcs11_ecdsa_method(void) {
++	static ECDSA_METHOD *pkcs11_ecdsa_method = NULL;
++	if(pkcs11_key_idx == -1) {
++		pkcs11_key_idx = ECDSA_get_ex_new_index(0, NULL, NULL, NULL, 0);
++	}
++	if(pkcs11_ecdsa_method == NULL) {
++		const ECDSA_METHOD *def = ECDSA_get_default_method();
++ #ifdef ECDSA_F_ECDSA_METHOD_NEW
++		pkcs11_ecdsa_method = ECDSA_METHOD_new((ECDSA_METHOD *)def);
++		ECDSA_METHOD_set_name(pkcs11_ecdsa_method, "pkcs11");
++		ECDSA_METHOD_set_sign(pkcs11_ecdsa_method, pkcs11_ecdsa_sign);
++ #else
++		pkcs11_ecdsa_method = xcalloc(1, sizeof(*pkcs11_ecdsa_method));
++		memcpy(pkcs11_ecdsa_method, def, sizeof(*pkcs11_ecdsa_method));
++		pkcs11_ecdsa_method->name = "pkcs11";
++		pkcs11_ecdsa_method->ecdsa_do_sign = pkcs11_ecdsa_sign;
++ #endif
++	}
++#endif
++	return pkcs11_ecdsa_method;
++}
++
++static int
++pkcs11_ecdsa_wrap(struct pkcs11_provider *provider, CK_ULONG slotidx,
++                  CK_ATTRIBUTE *keyid_attrib, CK_ATTRIBUTE *label_attrib, EC_KEY *ecdsa)
++{
++	struct pkcs11_key *k11;
++	k11 = xcalloc(1, sizeof(*k11));
++	k11->key_type = CKK_EC;
++	k11->provider = provider;
++	provider->refcount++; /* provider referenced by ECDSA key */
++	k11->slotidx = slotidx;
++	/* identify key object on smartcard */
++	k11->keyid_len = keyid_attrib->ulValueLen;
++	if (k11->keyid_len > 0) {
++		k11->keyid = xmalloc(k11->keyid_len);
++		memcpy(k11->keyid, keyid_attrib->pValue, k11->keyid_len);
++	}
++	if (label_attrib->ulValueLen > 0 ) {
++		k11->label = xmalloc(label_attrib->ulValueLen+1);
++		memcpy(k11->label, label_attrib->pValue, label_attrib->ulValueLen);
++		k11->label[label_attrib->ulValueLen] = 0;
++	}
++ #if (OPENSSL_VERSION_NUMBER >= 0x00010100L)
++	EC_KEY_set_method(ecdsa, get_pkcs11_ecdsa_method());
++	EC_KEY_set_ex_data(ecdsa, pkcs11_key_idx, k11);
++ #else
++	ECDSA_set_method(ecdsa, get_pkcs11_ecdsa_method());
++	ECDSA_set_ex_data(ecdsa, pkcs11_key_idx, k11);
++ #endif
++	return (0);
++}
++#endif /* ENABLE_PKCS11_ECDSA */
++
++int pkcs11_del_key(struct sshkey *key) {
++#ifdef ENABLE_PKCS11_ECDSA
++	if(key->type == KEY_ECDSA) {
++		struct pkcs11_key *k11 = (struct pkcs11_key *)
++ #if (OPENSSL_VERSION_NUMBER >= 0x00010100L)
++			EC_KEY_get_ex_data(key->ecdsa, pkcs11_key_idx);
++ #else
++			ECDSA_get_ex_data(key->ecdsa, pkcs11_key_idx);
++ #endif
++		if (k11 == NULL) {
++			error("EC_KEY_get_ex_data failed for ecdsa %p", key->ecdsa);
++		} else {
++			if (k11->provider)
++				pkcs11_provider_unref(k11->provider);
++			free(k11->keyid);
++			free(k11);
++		}
++	}
++#endif /* ENABLE_PKCS11_ECDSA */
++	sshkey_free(key);
++	return (0);
++}
++
+ /* remove trailing spaces */
+ static void
+ rmspace(u_char *buf, size_t len)
+@@ -371,16 +705,16 @@ pkcs11_open_session(struct pkcs11_provider *p, CK_ULONG slotidx, char *pin)
+ 	CK_SESSION_HANDLE	session;
+ 	int			login_required;
+ 
+-	f = p->function_list;
+-	login_required = p->slotinfo[slotidx].token.flags & CKF_LOGIN_REQUIRED;
++	f = p->module->function_list;
++	login_required = p->module->slotinfo[slotidx].token.flags & CKF_LOGIN_REQUIRED;
+ 	if (pin && login_required && !strlen(pin)) {
+ 		error("pin required");
+ 		return (-1);
+ 	}
+-	if ((rv = f->C_OpenSession(p->slotlist[slotidx], CKF_RW_SESSION|
++	if ((rv = f->C_OpenSession(p->module->slotlist[slotidx], CKF_RW_SESSION|
+ 	    CKF_SERIAL_SESSION, NULL, NULL, &session))
+ 	    != CKR_OK) {
+-		error("C_OpenSession failed: %lu", rv);
++		error("C_OpenSession failed for slot %lu: %lu", slotidx, rv);
+ 		return (-1);
+ 	}
+ 	if (login_required && pin) {
+@@ -392,9 +726,9 @@ pkcs11_open_session(struct pkcs11_provider *p, CK_ULONG slotidx, char *pin)
+ 				error("C_CloseSession failed: %lu", rv);
+ 			return (-1);
+ 		}
+-		p->slotinfo[slotidx].logged_in = 1;
++		p->module->slotinfo[slotidx].logged_in = 1;
+ 	}
+-	p->slotinfo[slotidx].session = session;
++	p->module->slotinfo[slotidx].session = session;
+ 	return (0);
+ }
+ 
+@@ -404,38 +738,95 @@ pkcs11_open_session(struct pkcs11_provider *p, CK_ULONG slotidx, char *pin)
+  * keysp points to an (possibly empty) array with *nkeys keys.
+  */
+ static int pkcs11_fetch_keys_filter(struct pkcs11_provider *, CK_ULONG,
+-    CK_ATTRIBUTE [], CK_ATTRIBUTE [3], struct sshkey ***, int *)
++    CK_ATTRIBUTE [], size_t, CK_ATTRIBUTE [3], struct sshkey ***, int *)
+ 	__attribute__((__bounded__(__minbytes__,4, 3 * sizeof(CK_ATTRIBUTE))));
+ 
+ static int
+ pkcs11_fetch_keys(struct pkcs11_provider *p, CK_ULONG slotidx,
+-    struct sshkey ***keysp, int *nkeys)
++    struct sshkey ***keysp, int *nkeys, struct pkcs11_uri *uri)
+ {
++	size_t filter_size = 2;
++	CK_KEY_TYPE pubkey_type = CKK_RSA;
+ 	CK_OBJECT_CLASS	pubkey_class = CKO_PUBLIC_KEY;
+ 	CK_OBJECT_CLASS	cert_class = CKO_CERTIFICATE;
+ 	CK_ATTRIBUTE		pubkey_filter[] = {
+-		{ CKA_CLASS, NULL, sizeof(pubkey_class) }
++		{ CKA_CLASS, NULL, sizeof(pubkey_class) },
++		{ CKA_KEY_TYPE, NULL, sizeof(pubkey_type) },
++		{ CKA_ID, NULL, 0 },
++		{ CKA_LABEL, NULL, 0 }
+ 	};
+ 	CK_ATTRIBUTE		cert_filter[] = {
+-		{ CKA_CLASS, NULL, sizeof(cert_class) }
++		{ CKA_CLASS, NULL, sizeof(cert_class) },
++		{ CKA_ID, NULL, 0 },
++		{ CKA_LABEL, NULL, 0 }
+ 	};
+ 	CK_ATTRIBUTE		pubkey_attribs[] = {
+ 		{ CKA_ID, NULL, 0 },
++		{ CKA_LABEL, NULL, 0 },
+ 		{ CKA_MODULUS, NULL, 0 },
+ 		{ CKA_PUBLIC_EXPONENT, NULL, 0 }
+ 	};
+ 	CK_ATTRIBUTE		cert_attribs[] = {
+ 		{ CKA_ID, NULL, 0 },
++		{ CKA_LABEL, NULL, 0 },
+ 		{ CKA_SUBJECT, NULL, 0 },
+ 		{ CKA_VALUE, NULL, 0 }
+ 	};
++#ifdef ENABLE_PKCS11_ECDSA
++	CK_KEY_TYPE	        ecdsa_type = CKK_EC;
++	CK_ATTRIBUTE		ecdsa_filter[] = {
++		{ CKA_CLASS, NULL, sizeof(pubkey_class) },
++		{ CKA_KEY_TYPE, NULL, sizeof(ecdsa_type) },
++		{ CKA_ID, NULL, 0 },
++		{ CKA_LABEL, NULL, 0 }
++	};
++	CK_ATTRIBUTE		ecdsa_attribs[] = {
++		{ CKA_ID, NULL, 0 },
++		{ CKA_LABEL, NULL, 0 },
++		{ CKA_EC_PARAMS, NULL, 0 },
++		{ CKA_EC_POINT, NULL, 0 }
++	};
++	ecdsa_filter[0].pValue = &pubkey_class;
++	ecdsa_filter[1].pValue = &ecdsa_type;
++#endif /* ENABLE_PKCS11_ECDSA */
+ 	pubkey_filter[0].pValue = &pubkey_class;
++	pubkey_filter[1].pValue = &pubkey_type;
+ 	cert_filter[0].pValue = &cert_class;
+ 
+-	if (pkcs11_fetch_keys_filter(p, slotidx, pubkey_filter, pubkey_attribs,
+-	    keysp, nkeys) < 0 ||
+-	    pkcs11_fetch_keys_filter(p, slotidx, cert_filter, cert_attribs,
+-	    keysp, nkeys) < 0)
++	if (uri->id != NULL) {
++		pubkey_filter[filter_size].pValue = uri->id;
++		pubkey_filter[filter_size].ulValueLen = uri->id_len;
++#ifdef ENABLE_PKCS11_ECDSA
++		ecdsa_filter[filter_size].pValue = uri->id;
++		ecdsa_filter[filter_size].ulValueLen = uri->id_len;
++#endif /* ENABLE_PKCS11_ECDSA */
++		cert_filter[filter_size-1].pValue = uri->id;
++		cert_filter[filter_size-1].ulValueLen = uri->id_len;
++		filter_size++;
++	}
++	if (uri->object != NULL) {
++		pubkey_filter[filter_size].pValue = uri->object;
++		pubkey_filter[filter_size].ulValueLen = strlen(uri->object);
++		pubkey_filter[filter_size].type = CKA_LABEL;
++#ifdef ENABLE_PKCS11_ECDSA
++		ecdsa_filter[filter_size].pValue = uri->object;
++		ecdsa_filter[filter_size].ulValueLen = strlen(uri->object);
++		ecdsa_filter[filter_size].type = CKA_LABEL;
++#endif /* ENABLE_PKCS11_ECDSA */
++		cert_filter[filter_size-1].pValue = uri->object;
++		cert_filter[filter_size-1].ulValueLen = strlen(uri->object);
++		cert_filter[filter_size-1].type = CKA_LABEL;
++		filter_size++;
++	}
++
++	if (pkcs11_fetch_keys_filter(p, slotidx, pubkey_filter, filter_size,
++	    pubkey_attribs, keysp, nkeys) < 0 ||
++#ifdef ENABLE_PKCS11_ECDSA
++	    pkcs11_fetch_keys_filter(p, slotidx, ecdsa_filter, filter_size,
++	    ecdsa_attribs, keysp, nkeys) < 0||
++#endif /* ENABLE_PKCS11_ECDSA */
++	    pkcs11_fetch_keys_filter(p, slotidx, cert_filter, filter_size - 1,
++	    cert_attribs, keysp, nkeys) < 0)
+ 		return (-1);
+ 	return (0);
+ }
+@@ -462,14 +853,20 @@ have_rsa_key(const RSA *rsa)
+ 
+ static int
+ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+-    CK_ATTRIBUTE filter[], CK_ATTRIBUTE attribs[3],
++    CK_ATTRIBUTE filter[], size_t filter_size, CK_ATTRIBUTE attribs[4],
+     struct sshkey ***keysp, int *nkeys)
+ {
+-	struct sshkey		*key;
++	struct sshkey		*key = NULL;
+ 	RSA			*rsa;
++#ifdef ENABLE_PKCS11_ECDSA
++	EC_KEY			*ecdsa;
++#else
++	void			*ecdsa;
++#endif /* ENABLE_PKCS11_ECDSA */
+ 	X509 			*x509;
+-	EVP_PKEY		*evp;
++	EVP_PKEY		*evp = NULL;
+ 	int			i;
++	int			nattribs = 4;
+ 	const u_char		*cp;
+ 	CK_RV			rv;
+ 	CK_OBJECT_HANDLE	obj;
+@@ -477,16 +874,15 @@ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+ 	CK_SESSION_HANDLE	session;
+ 	CK_FUNCTION_LIST	*f;
+ 
+-	f = p->function_list;
+-	session = p->slotinfo[slotidx].session;
++	f = p->module->function_list;
++	session = p->module->slotinfo[slotidx].session;
+ 	/* setup a filter the looks for public keys */
+-	if ((rv = f->C_FindObjectsInit(session, filter, 1)) != CKR_OK) {
++	if ((rv = f->C_FindObjectsInit(session, filter, filter_size)) != CKR_OK) {
+ 		error("C_FindObjectsInit failed: %lu", rv);
+ 		return (-1);
+ 	}
+ 	while (1) {
+-		/* XXX 3 attributes in attribs[] */
+-		for (i = 0; i < 3; i++) {
++		for (i = 0; i < nattribs; i++) {
+ 			attribs[i].pValue = NULL;
+ 			attribs[i].ulValueLen = 0;
+ 		}
+@@ -494,22 +890,22 @@ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+ 		    || nfound == 0)
+ 			break;
+ 		/* found a key, so figure out size of the attributes */
+-		if ((rv = f->C_GetAttributeValue(session, obj, attribs, 3))
++		if ((rv = f->C_GetAttributeValue(session, obj, attribs, nattribs))
+ 		    != CKR_OK) {
+ 			error("C_GetAttributeValue failed: %lu", rv);
+ 			continue;
+ 		}
+ 		/*
+-		 * Allow CKA_ID (always first attribute) to be empty, but
+-		 * ensure that none of the others are zero length.
++		 * Allow CKA_ID (always first attribute) and CKA_LABEL (second)
++		 * to be empty, but ensure that none of the others are zero length.
+ 		 * XXX assumes CKA_ID is always first.
+ 		 */
+-		if (attribs[1].ulValueLen == 0 ||
+-		    attribs[2].ulValueLen == 0) {
++		if (attribs[2].ulValueLen == 0 ||
++		    attribs[3].ulValueLen == 0) {
+ 			continue;
+ 		}
+ 		/* allocate buffers for attributes */
+-		for (i = 0; i < 3; i++) {
++		for (i = 0; i < nattribs; i++) {
+ 			if (attribs[i].ulValueLen > 0) {
+ 				attribs[i].pValue = xmalloc(
+ 				    attribs[i].ulValueLen);
+@@ -517,23 +913,26 @@ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+ 		}
+ 
+ 		/*
+-		 * retrieve ID, modulus and public exponent of RSA key,
+-		 * or ID, subject and value for certificates.
++		 * retrieve ID, label, modulus and public exponent of RSA key,
++		 * or ID, label, subject and value for certificates.
+ 		 */
+ 		rsa = NULL;
+-		if ((rv = f->C_GetAttributeValue(session, obj, attribs, 3))
++#ifdef ENABLE_PKCS11_ECDSA
++		ecdsa = NULL;
++#endif /* ENABLE_PKCS11_ECDSA */
++		if ((rv = f->C_GetAttributeValue(session, obj, attribs, nattribs))
+ 		    != CKR_OK) {
+ 			error("C_GetAttributeValue failed: %lu", rv);
+-		} else if (attribs[1].type == CKA_MODULUS ) {
++		} else if (attribs[2].type == CKA_MODULUS ) {
+ 			if ((rsa = RSA_new()) == NULL) {
+ 				error("RSA_new failed");
+ 			} else {
+ 				BIGNUM *rsa_n, *rsa_e;
+ 
+-				rsa_n = BN_bin2bn(attribs[1].pValue,
+-				    attribs[1].ulValueLen, NULL);
+-				rsa_e = BN_bin2bn(attribs[2].pValue,
++				rsa_n = BN_bin2bn(attribs[2].pValue,
+ 				    attribs[2].ulValueLen, NULL);
++				rsa_e = BN_bin2bn(attribs[3].pValue,
++				    attribs[3].ulValueLen, NULL);
+ 				if (rsa_n != NULL && rsa_e != NULL) {
+ 					if (!RSA_set0_key(rsa,
+ 					    rsa_n, rsa_e, NULL))
+@@ -543,30 +942,97 @@ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+ 				BN_free(rsa_n);
+ 				BN_free(rsa_e);
+ 			}
++#ifdef ENABLE_PKCS11_ECDSA
++		} else if (attribs[2].type == CKA_EC_PARAMS ) {
++			if ((ecdsa = EC_KEY_new()) == NULL) {
++				error("EC_KEY_new failed");
++			} else {
++				const unsigned char *ptr1 = attribs[2].pValue;
++				const unsigned char *ptr2 = attribs[3].pValue;
++				CK_ULONG len1 = attribs[2].ulValueLen;
++				CK_ULONG len2 = attribs[3].ulValueLen;
++				ASN1_OCTET_STRING *point = NULL;
++
++				/*
++				 * CKA_EC_PARAMS contains the curve parameters of the key
++				 * either referenced as an OID or directly with all values.
++				 * CKA_EC_POINT contains the point (public key) on the curve.
++				 * The point is should be returned inside a DER-encoded
++				 * ASN.1 OCTET STRING value (but some implementation).
++				 */
++				if ((point = d2i_ASN1_OCTET_STRING(NULL, &ptr2, len2))) {
++					/* Pointing to OCTET STRING content */
++					ptr2 = point->data;
++					len2 = point->length;
++				} else {
++					/* No OCTET STRING */
++					ptr2 = attribs[3].pValue;
++				}
++
++				if((d2i_ECParameters(&ecdsa, &ptr1, len1) == NULL) ||
++				   (o2i_ECPublicKey(&ecdsa, &ptr2, len2) == NULL)) {
++					EC_KEY_free(ecdsa);
++					ecdsa = NULL;
++					error("EC public key parsing failed");
++				}
++
++				if(point) {
++					ASN1_OCTET_STRING_free(point);
++				}
++			}
++#endif /* ENABLE_PKCS11_ECDSA */
+ 		} else {
+-			cp = attribs[2].pValue;
++			cp = attribs[3].pValue;
+ 			if ((x509 = X509_new()) == NULL) {
+ 				error("X509_new failed");
+-			} else if (d2i_X509(&x509, &cp, attribs[2].ulValueLen)
++			} else if (d2i_X509(&x509, &cp, attribs[3].ulValueLen)
+ 			    == NULL) {
+ 				error("d2i_X509 failed");
+-			} else if ((evp = X509_get_pubkey(x509)) == NULL ||
+-			    EVP_PKEY_base_id(evp) != EVP_PKEY_RSA ||
+-			    EVP_PKEY_get0_RSA(evp) == NULL) {
+-				debug("X509_get_pubkey failed or no rsa");
+-			} else if ((rsa = RSAPublicKey_dup(
+-			    EVP_PKEY_get0_RSA(evp))) == NULL) {
+-				error("RSAPublicKey_dup");
++			} else if ((evp = X509_get_pubkey(x509)) == NULL) {
++				debug("X509_get_pubkey failed");
++			} else {
++				switch (EVP_PKEY_base_id(evp)) {
++				case EVP_PKEY_RSA:
++					if (EVP_PKEY_get0_RSA(evp) == NULL)
++						debug("Missing RSA key");
++					else if ((rsa = RSAPublicKey_dup(
++					    EVP_PKEY_get0_RSA(evp))) == NULL)
++						error("RSAPublicKey_dup failed");
++					break;
++				case EVP_PKEY_EC:
++					if (EVP_PKEY_get0_EC_KEY(evp) == NULL)
++						debug("Missing ECDSA key");
++					else if ((ecdsa = EC_KEY_dup(
++					    EVP_PKEY_get0_EC_KEY(evp))) == NULL)
++						error("EC_KEY_dup failed");
++					break;
++				default:
++					debug("not a RSA or ECDSA key");
++					break;
++				}
+ 			}
+ 			X509_free(x509);
++			EVP_PKEY_free(evp);
+ 		}
+ 		if (rsa && have_rsa_key(rsa) &&
+-		    pkcs11_rsa_wrap(p, slotidx, &attribs[0], rsa) == 0) {
++		    pkcs11_rsa_wrap(p, slotidx, &attribs[0], &attribs[1], rsa) == 0) {
+ 			if ((key = sshkey_new(KEY_UNSPEC)) == NULL)
+ 				fatal("sshkey_new failed");
+ 			key->rsa = rsa;
+ 			key->type = KEY_RSA;
+ 			key->flags |= SSHKEY_FLAG_EXT;
++#ifdef ENABLE_PKCS11_ECDSA
++		} else if (ecdsa &&
++		    pkcs11_ecdsa_wrap(p, slotidx, &attribs[0], &attribs[1], ecdsa) == 0) {
++			if ((key = sshkey_new(KEY_UNSPEC)) == NULL)
++				fatal("sshkey_new failed");
++			key->ecdsa = ecdsa;
++			key->ecdsa_nid = sshkey_ecdsa_key_to_nid(key->ecdsa);
++			key->type = KEY_ECDSA;
++			key->flags |= SSHKEY_FLAG_EXT;
++#endif /* ENABLE_PKCS11_ECDSA */
++		}
++		if (key) {
+ 			if (pkcs11_key_included(keysp, nkeys, key)) {
+ 				sshkey_free(key);
+ 			} else {
+@@ -579,8 +1045,12 @@ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+ 			}
+ 		} else if (rsa) {
+ 			RSA_free(rsa);
++#ifdef ENABLE_PKCS11_ECDSA
++		} else if (ecdsa) {
++			EC_KEY_free(ecdsa);
++#endif /* ENABLE_PKCS11_ECDSA */
+ 		}
+-		for (i = 0; i < 3; i++)
++		for (i = 0; i < nattribs; i++)
+ 			free(attribs[i].pValue);
+ 	}
+ 	if ((rv = f->C_FindObjectsFinal(session)) != CKR_OK)
+@@ -592,126 +1062,239 @@ pkcs11_fetch_keys_filter(struct pkcs11_provider *p, CK_ULONG slotidx,
+ int
+ pkcs11_add_provider(char *provider_id, char *pin, struct sshkey ***keyp)
+ {
+-	int nkeys, need_finalize = 0;
+-	struct pkcs11_provider *p = NULL;
++	int rv;
++	struct pkcs11_uri *uri;
++
++	debug("%s: called, provider_id = %s", __func__, provider_id);
++
++	uri = pkcs11_uri_init();
++	if (uri == NULL)
++		fatal("Failed to init PCKS#11 URI");
++
++	if (strlen(provider_id) >= strlen(PKCS11_URI_SCHEME) &&
++	    strncmp(provider_id, PKCS11_URI_SCHEME, strlen(PKCS11_URI_SCHEME)) == 0) {
++		if (pkcs11_uri_parse(provider_id, uri) != 0)
++			fatal("Failed to parse PKCS#11 URI");
++	} else {
++		uri->module_path = strdup(provider_id);
++	}
++
++	rv = pkcs11_add_provider_by_uri(uri, pin, keyp);
++	pkcs11_uri_cleanup(uri);
++	return rv;
++}
++
++struct pkcs11_provider *
++pkcs11_provider_initialize(struct pkcs11_uri *uri)
++{
++	int need_finalize = 0;
+ 	void *handle = NULL;
+ 	CK_RV (*getfunctionlist)(CK_FUNCTION_LIST **);
+ 	CK_RV rv;
+ 	CK_FUNCTION_LIST *f = NULL;
+ 	CK_TOKEN_INFO *token;
+ 	CK_ULONG i;
++	char *provider_module = NULL;
++	struct pkcs11_provider *p;
++	struct pkcs11_module *m;
+ 
+-	*keyp = NULL;
+-	if (pkcs11_provider_lookup(provider_id) != NULL) {
+-		debug("%s: provider already registered: %s",
+-		    __func__, provider_id);
++	/* if no provider specified, fallback to p11-kit */
++	if (uri->module_path == NULL) {
++#ifdef PKCS11_DEFAULT_PROVIDER
++		provider_module = strdup(PKCS11_DEFAULT_PROVIDER);
++#else
++		error("%s: No module path provided", __func__);
+ 		goto fail;
++#endif
++	} else
++		provider_module = strdup(uri->module_path);
++
++	p = xcalloc(1, sizeof(*p));
++	p->name = pkcs11_uri_get(uri);
++
++	if ((m = pkcs11_provider_lookup_module(provider_module)) != NULL
++	    && m->valid) {
++		debug("%s: provider module already initialized: %s",
++		    __func__, provider_module);
++		free(provider_module);
++		/* Skip the initialization of PKCS#11 module */
++		m->refcount++;
++		p->module = m;
++		p->valid = 1;
++		TAILQ_INSERT_TAIL(&pkcs11_providers, p, next);
++		p->refcount++;	/* add to provider list */
++		return p;
++	} else {
++		m = xcalloc(1, sizeof(*m));
++		p->module = m;
++		m->refcount++;
+ 	}
++
+ 	/* open shared pkcs11-libarary */
+-	if ((handle = dlopen(provider_id, RTLD_NOW)) == NULL) {
+-		error("dlopen %s failed: %s", provider_id, dlerror());
++	if ((handle = dlopen(provider_module, RTLD_NOW)) == NULL) {
++		error("dlopen %s failed: %s", provider_module, dlerror());
+ 		goto fail;
+ 	}
+ 	if ((getfunctionlist = dlsym(handle, "C_GetFunctionList")) == NULL) {
+ 		error("dlsym(C_GetFunctionList) failed: %s", dlerror());
+ 		goto fail;
+ 	}
+-	p = xcalloc(1, sizeof(*p));
+-	p->name = xstrdup(provider_id);
+-	p->handle = handle;
++	m->handle = handle;
+ 	/* setup the pkcs11 callbacks */
+ 	if ((rv = (*getfunctionlist)(&f)) != CKR_OK) {
+ 		error("C_GetFunctionList for provider %s failed: %lu",
+-		    provider_id, rv);
++		    provider_module, rv);
+ 		goto fail;
+ 	}
+-	p->function_list = f;
++	m->function_list = f;
+ 	if ((rv = f->C_Initialize(NULL)) != CKR_OK) {
+ 		error("C_Initialize for provider %s failed: %lu",
+-		    provider_id, rv);
++		    provider_module, rv);
+ 		goto fail;
+ 	}
+ 	need_finalize = 1;
+-	if ((rv = f->C_GetInfo(&p->info)) != CKR_OK) {
++	if ((rv = f->C_GetInfo(&m->info)) != CKR_OK) {
+ 		error("C_GetInfo for provider %s failed: %lu",
+-		    provider_id, rv);
++		    provider_module, rv);
++		goto fail;
++	}
++	rmspace(m->info.manufacturerID, sizeof(m->info.manufacturerID));
++	if (uri->lib_manuf != NULL &&
++	    strcmp(uri->lib_manuf, m->info.manufacturerID)) {
++		debug("%s: Skipping provider %s not matching library_manufacturer",
++		    __func__, m->info.manufacturerID);
+ 		goto fail;
+ 	}
+-	rmspace(p->info.manufacturerID, sizeof(p->info.manufacturerID));
+-	rmspace(p->info.libraryDescription, sizeof(p->info.libraryDescription));
++	rmspace(m->info.libraryDescription, sizeof(m->info.libraryDescription));
+ 	debug("provider %s: manufacturerID <%s> cryptokiVersion %d.%d"
+ 	    " libraryDescription <%s> libraryVersion %d.%d",
+-	    provider_id,
+-	    p->info.manufacturerID,
+-	    p->info.cryptokiVersion.major,
+-	    p->info.cryptokiVersion.minor,
+-	    p->info.libraryDescription,
+-	    p->info.libraryVersion.major,
+-	    p->info.libraryVersion.minor);
+-	if ((rv = f->C_GetSlotList(CK_TRUE, NULL, &p->nslots)) != CKR_OK) {
++	    provider_module,
++	    m->info.manufacturerID,
++	    m->info.cryptokiVersion.major,
++	    m->info.cryptokiVersion.minor,
++	    m->info.libraryDescription,
++	    m->info.libraryVersion.major,
++	    m->info.libraryVersion.minor);
++
++	if ((rv = f->C_GetSlotList(CK_TRUE, NULL, &m->nslots)) != CKR_OK) {
+ 		error("C_GetSlotList failed: %lu", rv);
+ 		goto fail;
+ 	}
+-	if (p->nslots == 0) {
++	if (m->nslots == 0) {
+ 		debug("%s: provider %s returned no slots", __func__,
+-		    provider_id);
++		    provider_module);
+ 		goto fail;
+ 	}
+-	p->slotlist = xcalloc(p->nslots, sizeof(CK_SLOT_ID));
+-	if ((rv = f->C_GetSlotList(CK_TRUE, p->slotlist, &p->nslots))
++	m->slotlist = xcalloc(m->nslots, sizeof(CK_SLOT_ID));
++	if ((rv = f->C_GetSlotList(CK_TRUE, m->slotlist, &m->nslots))
+ 	    != CKR_OK) {
+ 		error("C_GetSlotList for provider %s failed: %lu",
+-		    provider_id, rv);
++		    provider_module, rv);
+ 		goto fail;
+ 	}
+-	p->slotinfo = xcalloc(p->nslots, sizeof(struct pkcs11_slotinfo));
++	m->slotinfo = xcalloc(m->nslots, sizeof(struct pkcs11_slotinfo));
++	m->valid = 1;
+ 	p->valid = 1;
+-	nkeys = 0;
+-	for (i = 0; i < p->nslots; i++) {
+-		token = &p->slotinfo[i].token;
+-		if ((rv = f->C_GetTokenInfo(p->slotlist[i], token))
++
++	for (i = 0; i < m->nslots; i++) {
++		token = &m->slotinfo[i].token;
++		if ((rv = f->C_GetTokenInfo(m->slotlist[i], token))
+ 		    != CKR_OK) {
+ 			error("C_GetTokenInfo for provider %s slot %lu "
+-			    "failed: %lu", provider_id, (unsigned long)i, rv);
++			    "failed: %lu", provider_module, (unsigned long)i, rv);
+ 			continue;
+ 		}
+ 		if ((token->flags & CKF_TOKEN_INITIALIZED) == 0) {
+-			debug2("%s: ignoring uninitialised token in "
+-			    "provider %s slot %lu", __func__,
+-			    provider_id, (unsigned long)i);
+ 			continue;
+ 		}
+ 		rmspace(token->label, sizeof(token->label));
+ 		rmspace(token->manufacturerID, sizeof(token->manufacturerID));
+ 		rmspace(token->model, sizeof(token->model));
+ 		rmspace(token->serialNumber, sizeof(token->serialNumber));
++	}
++	m->module_path = provider_module;
++	provider_module = NULL;
++
++	/* insert unconditionally -- remove if there will be no keys later */
++	TAILQ_INSERT_TAIL(&pkcs11_providers, p, next);
++	p->refcount++;	/* add to provider list */
++	return p;
++
++fail:
++	if (need_finalize && (rv = f->C_Finalize(NULL)) != CKR_OK)
++		error("C_Finalize for provider %s failed: %lu",
++		    provider_module, rv);
++	free(provider_module);
++	free(p);
++	if (handle)
++		dlclose(handle);
++	return NULL;
++}
++
++int
++pkcs11_add_provider_by_uri(struct pkcs11_uri *uri, char *pin, struct sshkey ***keyp)
++{
++	int nkeys;
++	struct pkcs11_provider *p = NULL;
++	CK_TOKEN_INFO *token;
++	CK_ULONG i;
++	char *provider_uri = pkcs11_uri_get(uri);
++
++	debug("%s: called, provider_uri = %s", __func__, provider_uri);
++
++	*keyp = NULL;
++	if ((p = pkcs11_provider_initialize(uri)) == NULL) {
++		debug("%s: failed to initialize provider: %s",
++		    __func__, provider_uri);
++		goto fail;
++	}
++
++	nkeys = 0;
++	for (i = 0; i < p->module->nslots; i++) {
++		token = &p->module->slotinfo[i].token;
++		if ((token->flags & CKF_TOKEN_INITIALIZED) == 0) {
++			debug2("%s: ignoring uninitialised token in "
++			    "provider %s slot %lu", __func__,
++			    provider_uri, (unsigned long)i);
++			continue;
++		}
++		if (uri->token != NULL &&
++		    strcmp(token->label, uri->token) != 0) {
++			debug2("%s: ignoring token not matching label (%s) "
++			    "specified by PKCS#11 URI in slot %lu", __func__,
++			    token->label, (unsigned long)i);
++			continue;
++		}
++		if (uri->manuf != NULL &&
++		    strcmp(token->manufacturerID, uri->manuf) != 0) {
++			debug2("%s: ignoring token not matching requrested "
++			    "manufacturerID (%s) specified by PKCS#11 URI in "
++			    "slot %lu", __func__,
++			    token->manufacturerID, (unsigned long)i);
++			continue;
++		}
+ 		debug("provider %s slot %lu: label <%s> manufacturerID <%s> "
+ 		    "model <%s> serial <%s> flags 0x%lx",
+-		    provider_id, (unsigned long)i,
++		    provider_uri, (unsigned long)i,
+ 		    token->label, token->manufacturerID, token->model,
+ 		    token->serialNumber, token->flags);
+-		/* open session, login with pin and retrieve public keys */
+-		if (pkcs11_open_session(p, i, pin) == 0)
+-			pkcs11_fetch_keys(p, i, keyp, &nkeys);
++		/* open session if not yet opened, login with pin
++		 * and retrieve public keys */
++		if ((p->module->slotinfo[i].session != 0) ||
++		    pkcs11_open_session(p, i, pin) == 0)
++			pkcs11_fetch_keys(p, i, keyp, &nkeys, uri);
+ 	}
+ 	if (nkeys > 0) {
+-		TAILQ_INSERT_TAIL(&pkcs11_providers, p, next);
+-		p->refcount++;	/* add to provider list */
++		free(provider_uri);
+ 		return (nkeys);
+ 	}
+-	debug("%s: provider %s returned no keys", __func__, provider_id);
++	debug("%s: provider %s returned no keys", __func__, provider_uri);
+ 	/* don't add the provider, since it does not have any keys */
+ fail:
+-	if (need_finalize && (rv = f->C_Finalize(NULL)) != CKR_OK)
+-		error("C_Finalize for provider %s failed: %lu",
+-		    provider_id, rv);
+ 	if (p) {
+-		free(p->slotlist);
+-		free(p->slotinfo);
+-		free(p);
++		pkcs11_provider_unref(p);
+ 	}
+-	if (handle)
+-		dlclose(handle);
++	free(provider_uri);
+ 	return (-1);
+ }
+ 
+diff --git a/ssh-pkcs11.h b/ssh-pkcs11.h
+index 0ced74f2..23d04ac7 100644
+--- a/ssh-pkcs11.h
++++ b/ssh-pkcs11.h
+@@ -14,10 +14,16 @@
+  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
++
++#include "ssh-pkcs11-uri.h"
++
+ int	pkcs11_init(int);
+ void	pkcs11_terminate(void);
+ int	pkcs11_add_provider(char *, char *, struct sshkey ***);
++int	pkcs11_del_key(struct sshkey *);
++int	pkcs11_add_provider_by_uri(struct pkcs11_uri *, char *, struct sshkey ***);
+ int	pkcs11_del_provider(char *);
++int	pkcs11_uri_write(const struct sshkey *, FILE *);
+ 
+ #if !defined(WITH_OPENSSL) && defined(ENABLE_PKCS11)
+ #undef ENABLE_PKCS11
+diff --git a/ssh.c b/ssh.c
+index 0777c31e..1d301f4d 100644
+--- a/ssh.c
++++ b/ssh.c
+@@ -769,6 +769,14 @@ main(int ac, char **av)
+ 			options.gss_deleg_creds = 1;
+ 			break;
+ 		case 'i':
++#ifdef ENABLE_PKCS11
++			if (strlen(optarg) >= strlen(PKCS11_URI_SCHEME) &&
++			    strncmp(optarg, PKCS11_URI_SCHEME,
++			    strlen(PKCS11_URI_SCHEME)) == 0) {
++				add_identity_file(&options, NULL, optarg, 1);
++				break;
++			}
++#endif
+ 			p = tilde_expand_filename(optarg, getuid());
+ 			if (stat(p, &st) < 0)
+ 				fprintf(stderr, "Warning: Identity file %s "
+@@ -1975,6 +1983,45 @@ ssh_session2(struct ssh *ssh, struct passwd *pw)
+ 	    options.escape_char : SSH_ESCAPECHAR_NONE, id);
+ }
+ 
++#ifdef ENABLE_PKCS11
++static void
++load_pkcs11_identity(char *pkcs11_uri, char *identity_files[],
++    struct sshkey *identity_keys[], int *n_ids)
++{
++	int nkeys, i;
++	struct sshkey **keys;
++	struct pkcs11_uri *uri;
++
++	debug("identity file '%s' from pkcs#11", pkcs11_uri);
++	uri = pkcs11_uri_init();
++	if (uri == NULL)
++		fatal("Failed to init PCKS#11 URI");
++
++	if (pkcs11_uri_parse(pkcs11_uri, uri) != 0)
++	fatal("Failed to parse PKCS#11 URI %s", pkcs11_uri);
++
++	/* we need to merge URI and provider together */
++	if (options.pkcs11_provider != NULL && uri->module_path == NULL)
++		uri->module_path = strdup(options.pkcs11_provider);
++
++	if (options.num_identity_files < SSH_MAX_IDENTITY_FILES &&
++	    (nkeys = pkcs11_add_provider_by_uri(uri, NULL, &keys)) > 0) {
++		for (i = 0; i < nkeys; i++) {
++			if (*n_ids >= SSH_MAX_IDENTITY_FILES) {
++				sshkey_free(keys[i]);
++				continue;
++			}
++			identity_keys[*n_ids] = keys[i];
++			identity_files[*n_ids] = pkcs11_uri_get(uri);
++			(*n_ids)++;
++		}
++		free(keys);
++	}
++
++	pkcs11_uri_cleanup(uri);
++}
++#endif /* ENABLE_PKCS11 */
++
+ /* Loads all IdentityFile and CertificateFile keys */
+ static void
+ load_public_identity_files(struct passwd *pw)
+@@ -1989,10 +2036,6 @@ load_public_identity_files(struct passwd *pw)
+ 	char *certificate_files[SSH_MAX_CERTIFICATE_FILES];
+ 	struct sshkey *certificates[SSH_MAX_CERTIFICATE_FILES];
+ 	int certificate_file_userprovided[SSH_MAX_CERTIFICATE_FILES];
+-#ifdef ENABLE_PKCS11
+-	struct sshkey **keys;
+-	int nkeys;
+-#endif /* PKCS11 */
+ 
+ 	n_ids = n_certs = 0;
+ 	memset(identity_files, 0, sizeof(identity_files));
+@@ -2005,32 +2048,46 @@ load_public_identity_files(struct passwd *pw)
+ 	    sizeof(certificate_file_userprovided));
+ 
+ #ifdef ENABLE_PKCS11
+-	if (options.pkcs11_provider != NULL &&
+-	    options.num_identity_files < SSH_MAX_IDENTITY_FILES &&
+-	    (pkcs11_init(!options.batch_mode) == 0) &&
+-	    (nkeys = pkcs11_add_provider(options.pkcs11_provider, NULL,
+-	    &keys)) > 0) {
+-		for (i = 0; i < nkeys; i++) {
+-			if (n_ids >= SSH_MAX_IDENTITY_FILES) {
+-				sshkey_free(keys[i]);
+-				continue;
+-			}
+-			identity_keys[n_ids] = keys[i];
+-			identity_files[n_ids] =
+-			    xstrdup(options.pkcs11_provider); /* XXX */
+-			n_ids++;
+-		}
+-		free(keys);
++	/* handle fallback from PKCS11Provider option */
++	pkcs11_init(!options.batch_mode);
++
++	if (options.pkcs11_provider != NULL) {
++		struct pkcs11_uri *uri;
++
++		uri = pkcs11_uri_init();
++		if (uri == NULL)
++			fatal("Failed to init PCKS#11 URI");
++
++		/* Construct simple PKCS#11 URI to simplify access */
++		uri->module_path = strdup(options.pkcs11_provider);
++
++		/* Add it as any other IdentityFile */
++		cp = pkcs11_uri_get(uri);
++		add_identity_file(&options, NULL, cp, 1);
++		free(cp);
++
++		pkcs11_uri_cleanup(uri);
+ 	}
+ #endif /* ENABLE_PKCS11 */
+ 	for (i = 0; i < options.num_identity_files; i++) {
++		char *name = options.identity_files[i];
+ 		if (n_ids >= SSH_MAX_IDENTITY_FILES ||
+-		    strcasecmp(options.identity_files[i], "none") == 0) {
++		    strcasecmp(name, "none") == 0) {
+ 			free(options.identity_files[i]);
+ 			options.identity_files[i] = NULL;
+ 			continue;
+ 		}
+-		cp = tilde_expand_filename(options.identity_files[i], getuid());
++#ifdef ENABLE_PKCS11
++		if (strlen(name) >= strlen(PKCS11_URI_SCHEME) &&
++		    strncmp(name, PKCS11_URI_SCHEME,
++		    strlen(PKCS11_URI_SCHEME)) == 0) {
++			load_pkcs11_identity(name, identity_files,
++			    identity_keys, &n_ids);
++			free(options.identity_files[i]);
++			continue;
++		}
++#endif /* ENABLE_PKCS11 */
++		cp = tilde_expand_filename(name, getuid());
+ 		filename = percent_expand(cp, "d", pw->pw_dir,
+ 		    "u", pw->pw_name, "l", thishost, "h", host,
+ 		    "r", options.user, (char *)NULL);
+diff --git a/ssh_config.5 b/ssh_config.5
+index 4d5b01d3..0db6c225 100644
+--- a/ssh_config.5
++++ b/ssh_config.5
+@@ -934,6 +934,19 @@ may also be used in conjunction with
+ .Cm CertificateFile
+ in order to provide any certificate also needed for authentication with
+ the identity.
++.Pp
++The authentication identity can be also specified in a form of PKCS#11 URI
++starting with a string
++.Cm pkcs11: .
++There is supported a subset of the PKCS#11 URI as defined
++in RFC 7512 (implemented path arguments
++.Cm id ,
++.Cm manufacturer ,
++.Cm object ,
++.Cm token
++and query argument
++.Cm module-path
++). The URI can not be in quotes.
+ .It Cm IgnoreUnknown
+ Specifies a pattern-list of unknown options to be ignored if they are
+ encountered in configuration parsing.
+diff --git a/sshd.c b/sshd.c
+index ba26287b..d286e6e9 100644
+--- a/sshd.c
++++ b/sshd.c
+@@ -373,7 +373,8 @@ sshd_exchange_identification(struct ssh *ssh, int sock_in, int sock_out)
+ 	char remote_version[256];	/* Must be at least as big as buf. */
+ 
+ 	xasprintf(&server_version_string, "SSH-%d.%d-%.100s%s%s\r\n",
+-	    PROTOCOL_MAJOR_2, PROTOCOL_MINOR_2, SSH_VERSION,
++	    PROTOCOL_MAJOR_2, PROTOCOL_MINOR_2,
++	    (options.show_patchlevel == 1) ? SSH_VENDOR_PATCHLEVEL : SSH_VERSION,
+ 	    *options.version_addendum == '\0' ? "" : " ",
+ 	    options.version_addendum);
+ 
+@@ -1721,7 +1722,8 @@ main(int ac, char **av)
+ 		exit(1);
+ 	}
+ 
+-	debug("sshd version %s, %s", SSH_VERSION,
++	debug("sshd version %s, %s", 
++		(options.show_patchlevel == 1) ? SSH_VENDOR_PATCHLEVEL : SSH_VERSION,
+ #ifdef WITH_OPENSSL
+ 	    SSLeay_version(SSLEAY_VERSION)
+ #else
+diff --git a/sshd_config b/sshd_config
+index 19b7c91a..391d7d9b 100644
+--- a/sshd_config
++++ b/sshd_config
+@@ -95,6 +95,7 @@ AuthorizedKeysFile	.ssh/authorized_keys
+ #Compression delayed
+ #ClientAliveInterval 0
+ #ClientAliveCountMax 3
++#ShowPatchLevel no
+ #UseDNS no
+ #PidFile /var/run/sshd.pid
+ #MaxStartups 10:30:100
+diff --git a/sshd_config.5 b/sshd_config.5
+index c6484370..3a71e452 100644
+--- a/sshd_config.5
++++ b/sshd_config.5
+@@ -1484,6 +1484,13 @@ via
+ .Cm AcceptEnv
+ or
+ .Cm PermitUserEnvironment .
++.It Cm ShowPatchLevel 
++Specifies whether 
++.Nm sshd 
++will display the patch level of the binary in the identification string. 
++The patch level is set at compile-time. 
++The default is 
++.Dq no . 
+ .It Cm StreamLocalBindMask
+ Sets the octal file creation mode mask
+ .Pq umask
+-- 
+2.17.2 (Apple Git-113)
+
