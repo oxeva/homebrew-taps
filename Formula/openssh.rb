@@ -30,6 +30,16 @@ class Openssh < Formula
     sha256 "3505c58bf1e584c8af92d916fe5f3f1899a6b15cc64a00ddece1dc0874b2f78f"
   end
 
+  patch do
+    url "https://github.com/oxeva/homebrew-taps/raw/master/patches/0001-Apply-PKCS11-ECDSA-and-PKCS11-URI-patches-from-Fedor.patch"
+    sha256 "90706e35c7722924dcfb4d1a50fc0cf8ae14e7970e870096306714c4c34c22d5"
+  end
+
+  patch do
+    url "https://github.com/oxeva/homebrew-taps/raw/master/patches/0002-Add-support-to-load-additional-certificates.patch"
+    sha256 "ae59ac22baeb4cc0965334173ca8f92ee13111033976d99cf15b284b7b402d98"
+  end
+
   def install
     ENV.append "CPPFLAGS", "-D__APPLE_SANDBOX_NAMED_EXTERNAL__"
 
@@ -40,13 +50,14 @@ class Openssh < Formula
     args = %W[
       --prefix=#{prefix}
       --sysconfdir=#{etc}/ssh
-      --with-ldns
       --with-libedit
       --with-kerberos5
       --with-pam
       --with-ssl-dir=#{Formula["openssl@1.1"].opt_prefix}
+      --with-default-pkcs11-provider=/usr/local/lib/opensc-pkcs11.so
     ]
 
+    system "autoreconf"
     system "./configure", *args
     system "make"
     ENV.deparallelize
