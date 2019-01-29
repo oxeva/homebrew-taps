@@ -87,20 +87,17 @@ class Openssh < Formula
                         <string>-a</string>
                         <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
                 </array>
+                <key>EnvironmentVariables</key>
+                <dict>
+                        <key>SSH_AUTH_SOCK</key>
+                        <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
+                </dict>
                 <key>RunAtLoad</key>
                 <true/>
                 <key>KeepAlive</key>
 	              <dict>
                         <key>SuccessfulExit</key>
                         <false/>
-                </dict>
-                <key>Sockets</key>
-                <dict>
-                        <key>Listener</key>
-                        <dict>
-                          <key>SockPathName</key>
-                          <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
-                        </dict>
                 </dict>
                 <key>EnableTransactions</key>
                 <true/>
