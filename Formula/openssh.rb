@@ -12,7 +12,6 @@ class Openssh < Formula
   depends_on "pkg-config" => :build
   depends_on "ldns"
   depends_on "openssl@1.1"
-  depends_on "opensc"
 
   resource "com.openssh.sshd.sb" do
     url "https://opensource.apple.com/source/OpenSSH/OpenSSH-209.50.1/com.openssh.sshd.sb"
