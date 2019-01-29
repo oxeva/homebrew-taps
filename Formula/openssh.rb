@@ -9,8 +9,9 @@ class Openssh < Formula
   # Please don't resubmit the keychain patch option. It will never be accepted.
   # https://github.com/Homebrew/homebrew-dupes/pull/482#issuecomment-118994372
 
+  depends_on "autoconf" => :build
   depends_on "pkg-config" => :build
-  depends_on "ldns"
+#  depends_on "ldns"
   depends_on "openssl@1.1"
 
   resource "com.openssh.sshd.sb" do
