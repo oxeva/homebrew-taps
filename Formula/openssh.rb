@@ -42,7 +42,7 @@ class Openssh < Formula
   end
 
   def install
-    ENV.append "CPPFLAGS", "-D__APPLE_SANDBOX_NAMED_EXTERNAL__"
+    ENV.append "CPPFLAGS", "-D__APPLE_SANDBOX_NAMED_EXTERNAL__ -D__APPLE_LAUNCHD__"
 
     # Ensure sandbox profile prefix is correct.
     # We introduce this issue with patching, it's not an upstream bug.
