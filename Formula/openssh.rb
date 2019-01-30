@@ -83,21 +83,15 @@ class Openssh < Formula
                 <key>ProgramArguments</key>
                 <array>
                         <string>/usr/local/bin/ssh-agent</string>
-                        <string>-D</string>
-                        <string>-a</string>
-                        <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
+                        <string>-l</string>
                 </array>
-                <key>EnvironmentVariables</key>
+                <key>Sockets</key>
                 <dict>
-                        <key>SSH_AUTH_SOCK</key>
-                        <string>#{ENV["HOME"]}/.ssh-agent.sock</string>
-                </dict>
-                <key>RunAtLoad</key>
-                <true/>
-                <key>KeepAlive</key>
-	              <dict>
-                        <key>SuccessfulExit</key>
-                        <false/>
+                        <key>Listeners</key>
+                        <dict>
+                              <key>SecureSocketWithKey</key>
+                              <string>SSH_AUTH_SOCK</string>
+                        </dict>
                 </dict>
                 <key>EnableTransactions</key>
                 <true/>
