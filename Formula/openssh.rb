@@ -41,6 +41,11 @@ class Openssh < Formula
     sha256 "ae59ac22baeb4cc0965334173ca8f92ee13111033976d99cf15b284b7b402d98"
   end
 
+  patch do
+    url "https://github.com/oxeva/homebrew-taps/raw/master/patches/0003-ssh-agent-launchd-integration.patch"
+    sha256 "c4c8131f57595f1fa629422d7c9419540a108d308110cb62ff00ef526d35f384"
+  end
+
   def install
     ENV.append "CPPFLAGS", "-D__APPLE_SANDBOX_NAMED_EXTERNAL__ -D__APPLE_LAUNCHD__"
 
