@@ -95,7 +95,7 @@ class Openssh < Formula
                         <key>Listeners</key>
                         <dict>
                               <key>SecureSocketWithKey</key>
-                              <string>SSH_AUTH_SOCK</string>
+                              <string>BREW_SSH_AUTH_SOCK</string>
                         </dict>
                 </dict>
                 <key>EnableTransactions</key>
