@@ -78,6 +78,26 @@ class Openssh < Formula
     (etc/"ssh").install "com.openssh.sshd.sb" => "org.openssh.sshd.sb"
   end
 
+  def caveats
+    s = <<-EOS.undent
+
+    Put this in your shell RC file:
+
+    if [ -z $SYSTEM_SSH_AUTH_SOCK ]; then
+    	export SYSTEM_SSH_AUTH_SOCK=$SSH_AUTH_SOCK
+    	launchctl setenv SSH_AUTH_SOCK $BREW_SSH_AUTH_SOCK
+    	export SSH_AUTH_SOCK=$BREW_SSH_AUTH_SOCK
+    fi
+
+    Then start the ssh-agent listener at boot with :
+
+    brew services start openssh
+
+    EOS
+    s
+  end
+
+
   def plist; <<~EOS
     <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
