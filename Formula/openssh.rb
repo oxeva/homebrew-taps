@@ -78,10 +78,8 @@ class Openssh < Formula
     (etc/"ssh").install "com.openssh.sshd.sb" => "org.openssh.sshd.sb"
   end
 
-  def caveats
-    s = <<-EOS.undent
-
-    Put this in your shell RC file:
+  def caveats; <<~EOS
+    Put this into your shell RC file:
 
     if [ -z $SYSTEM_SSH_AUTH_SOCK ]; then
     	export SYSTEM_SSH_AUTH_SOCK=$SSH_AUTH_SOCK
@@ -94,7 +92,6 @@ class Openssh < Formula
     brew services start openssh
 
     EOS
-    s
   end
 
 
